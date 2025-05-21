@@ -4,7 +4,10 @@
 #include "Helpers.h"
 #include "Log.h"
 
+#include "IconData.h"
+#include "RobotoFontData.h"
 #include "stb_image.h"
+
 
 #if MANDRILL_WINDOWS
 // Include windows.h first
@@ -17,39 +20,31 @@ using namespace Mandrill;
 
 static void errorCallback(int errorCode, const char* pDescription)
 {
-    Log::Error("GLFW error {}: {}", errorCode, pDescription);
+    Log::error("GLFW error {}: {}", errorCode, pDescription);
 }
 
 App::App(const std::string& title, uint32_t width, uint32_t height) : mWidth(width), mHeight(height)
 {
-    Log::Info("=== Mandrill {}.{}.{} ===", MANDRILL_VERSION_MAJOR, MANDRILL_VERSION_MINOR, MANDRILL_VERSION_PATCH);
+    Log::info("=== Mandrill {}.{}.{} ===", MANDRILL_VERSION_MAJOR, MANDRILL_VERSION_MINOR, MANDRILL_VERSION_PATCH);
 
-    Log::Info("Initializing GLFW");
+    Log::info("Initializing GLFW");
     initGLFW(title, width, height);
 
-    Log::Info("Initializing ImGUI");
+    Log::info("Initializing ImGUI");
     initImGUI();
-
-#ifdef MANDRILL_USE_OPENVDB
-    openvdb::initialize();
-#endif
 
     mFullscreen = false;
 }
 
 App::~App()
 {
-#ifdef MANDRILL_USE_OPENVDB
-    openvdb::uninitialize();
-#endif
-
     glfwDestroyWindow(mpWindow);
     glfwTerminate();
 }
 
 void App::run()
 {
-    Log::Info("Running...");
+    Log::info("Running...");
 
     while (!glfwWindowShouldClose(mpWindow)) {
         mDelta = static_cast<float>(glfwGetTime());
@@ -78,7 +73,7 @@ void App::run()
         glfwPollEvents();
     }
 
-    Log::Info("Exiting...");
+    Log::info("Exiting...");
 }
 
 void App::createGUI(ptr<Device> pDevice, ptr<Pass> pPass)
@@ -119,7 +114,9 @@ void App::createGUI(ptr<Device> pDevice, ptr<Pass> pPass)
 
     // Create fonts texture
     ImGuiIO& io = ImGui::GetIO();
-    mFont = io.Fonts->AddFontFromFileTTF("Roboto.ttf", 16);
+    mFont = io.Fonts->AddFontFromMemoryTTF((void*)res_Roboto_ttf, // Or whatever xxd named it
+                                           res_Roboto_ttf_len,    // Or whatever xxd named it
+                                           16.0f);
 
     ImGui_ImplVulkan_CreateFontsTexture();
 
@@ -308,7 +305,7 @@ void App::baseGUI(ptr<Device> pDevice, ptr<Swapchain> pSwapchain, std::vector<pt
                 ShellExecute(0, 0, "https://github.com/rikardolajos/Mandrill/tree/master", 0, 0, SW_SHOW);
 #elif MANDRILL_LINUX
                 if (std::system("xdg-open https://github.com/rikardolajos/Mandrill/tree/master")) {
-                    Log::Error("Unable to open browser");
+                    Log::error("Unable to open browser");
                 }
 #endif
             }
@@ -409,7 +406,7 @@ void App::baseMouseButtonCallback(GLFWwindow* pWindow, int button, int action, i
 void App::initGLFW(const std::string& title, uint32_t width, uint32_t height)
 {
     if (glfwInit() == GLFW_FALSE) {
-        Log::Error("Failed to initialze GLFW");
+        Log::error("Failed to initialze GLFW");
         Check::GLFW();
     }
 
@@ -418,7 +415,7 @@ void App::initGLFW(const std::string& title, uint32_t width, uint32_t height)
     // Save video mode of fullscreen mode
     mpMonitor = glfwGetPrimaryMonitor();
     if (!mpMonitor) {
-        Log::Error("Failed to find primary monitor");
+        Log::error("Failed to find primary monitor");
         Check::GLFW();
     }
     const GLFWvidmode* mode = glfwGetVideoMode(mpMonitor);
@@ -435,21 +432,22 @@ void App::initGLFW(const std::string& title, uint32_t width, uint32_t height)
     std::string fullTitle = std::format("Mandrill: {}", title);
     mpWindow = glfwCreateWindow(width, height, fullTitle.c_str(), nullptr, nullptr);
     if (!mpWindow) {
-        Log::Error("Failed to create window");
+        Log::error("Failed to create window");
         Check::GLFW();
     }
 
     GLFWimage image = {};
-    image.pixels = stbi_load("icon.png", &image.width, &image.height, nullptr, 4);
+    image.pixels = stbi_load_from_memory(res_icon_png, static_cast<int>(res_icon_png_len), &image.width, &image.height,
+                                         nullptr, 4);
     if (image.pixels) {
         glfwSetWindowIcon(mpWindow, 1, &image);
         stbi_image_free(image.pixels);
     } else {
-        Log::Error("Failed to load icon.png");
+        Log::error("Failed to load icon.png");
     }
 
     if (!glfwVulkanSupported()) {
-        Log::Error("Failed to find Vulkan");
+        Log::error("Failed to find Vulkan");
         Check::GLFW();
     }
 
@@ -472,22 +470,21 @@ void App::initImGUI()
     ImGui_ImplGlfw_InitForVulkan(mpWindow, true);
 }
 
-static void saveScreenshot(uint8_t* pData, uint32_t width, uint32_t height, uint32_t channels)
+static void saveScreenshot(uint8_t* data, uint32_t width, uint32_t height, uint32_t channels)
 {
     char timestamp[64];
     time_t t = std::time(nullptr);
     std::strftime(timestamp, 64, "%G-%m-%d_%H-%M-%S", std::localtime(&t));
-    std::filesystem::path filename = std::format("Screenshot_{}.png", timestamp);
-    stbi_write_png(filename.string().c_str(), width, height, channels, pData, width * 4);
+    std::filesystem::path filename = std::format("{}.png", timestamp);
+    stbi_write_png(filename.string().c_str(), width, height, channels, data, width * 4);
     auto fullpath = std::filesystem::current_path() / filename;
-    std::free(pData);
 
-    Log::Info("Screenshot saved to {}", fullpath.string());
+    Log::info("Screenshot saved to {}", fullpath.string());
 }
 
 void App::takeScreenshot(ptr<Device> pDevice, ptr<Swapchain> pSwapchain)
 {
-    Log::Info("Taking screenshot and saving to disk...");
+    Log::info("Taking screenshot and saving to disk...");
 
     const uint32_t channels = 4;
 
@@ -499,26 +496,19 @@ void App::takeScreenshot(ptr<Device> pDevice, ptr<Swapchain> pSwapchain)
     Buffer buffer(pDevice, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     Helpers::copyImageToBuffer(pDevice, pSwapchain->getImage(), buffer.getBuffer(), pSwapchain->getExtent().width,
-                               pSwapchain->getExtent().height, 1);
+                               pSwapchain->getExtent().height);
     Helpers::transitionImageLayout(pDevice, pSwapchain->getImage(), pSwapchain->getImageFormat(),
                                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, 1);
-    uint8_t* pData = static_cast<uint8_t*>(buffer.getHostMap());
+    uint8_t* data = static_cast<uint8_t*>(buffer.getHostMap());
 
     // BGR -> RGB
     for (uint32_t i = 0; i < size; i += channels) {
-        std::swap(pData[i], pData[i + 2]);
+        std::swap(data[i], data[i + 2]);
     }
-
-    uint8_t* pDataCopy = static_cast<uint8_t*>(std::malloc(buffer.getSize()));
-    if (!pDataCopy) {
-        Log::Error("Failed to allocate buffer for screenshot");
-        return;
-    }
-    std::memcpy(pDataCopy, pData, buffer.getSize());
 
     // Run in a thread since saving takes forever
     auto thread =
-        std::thread(saveScreenshot, pDataCopy, pSwapchain->getExtent().width, pSwapchain->getExtent().height, channels);
+        std::thread(saveScreenshot, data, pSwapchain->getExtent().width, pSwapchain->getExtent().height, channels);
     thread.detach();
 }
 

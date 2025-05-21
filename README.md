@@ -46,10 +46,9 @@ To build and compile the project use:
 
 	cmake --build .
 
-To run the project, change to the binary output folder and run a executable file:
+To run the project, run the executable file:
 
-	cd {Debug,Release}/bin
-	./SampleApp.bin
+	./bin/SampleApp.bin
 
 ## Setting up a new project with Mandrill as submodule
 
