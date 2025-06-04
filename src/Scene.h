@@ -11,6 +11,9 @@
 #include "Swapchain.h"
 #include "Texture.h"
 
+#include "model_loader.h"
+#define MAX_NEURAL_FEATURE_GRID_LEVELS 4
+
 namespace Mandrill
 {
     struct Vertex {
@@ -46,6 +49,7 @@ namespace Mandrill
         float opacity;
         glm::vec3 emission;
         uint32_t hasTexture;
+        uint32_t isNeuralTexture;
     };
 
     struct alignas(16) MaterialDevice {
@@ -69,6 +73,14 @@ namespace Mandrill
         std::string normalTexturePath;
 
         ptr<Descriptor> pDescriptor;
+
+        // Added field NTC below
+        std::string name;
+        bool isNeuralTexture = false;
+        const MaterialSpecificData* pCpuNeuralMaterialData = nullptr;
+
+        std::map<std::pair<int, int>, ptr<Texture>> neuralVQGrids;
+        std::map<std::pair<int, int>, glm::ivec2> neuralVQGridShapes;
     };
 
     struct InstanceData {
@@ -196,21 +208,22 @@ namespace Mandrill
         /// Create a new scene.
         ///
         /// The scene will use descriptor sets as follows:
-        ///     Camera matrix (struct CameraMatrices): Set = 0, Binding = 0, Type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC
-        ///     Model matrix (mat4): Set = 1, Binding = 0, Type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC
-        ///     Material params (struct MaterialParams): Set = 2, Binding = 0, Type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
-        ///     Material diffuse texture: Set = 2, Binding = 1, Type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
-        ///     Material specular texture: Set = 2, Binding = 2, Type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
-        ///     Material ambient texture: Set = 2, Binding = 3, Type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
-        ///     Material emission texture: Set = 2, Binding = 4, Type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
-        ///     Material normal texture: Set = 2, Binding = 5, Type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
-        ///     Acceleration structure: Set = 3, Binding = 0, Type = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR
-        ///     Storage output image: Set = 3, Binding = 1, Type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
-        ///     Scene vertex buffer: Set = 3, Binding = 2, Type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
-        ///     Scene index buffer: Set = 3, Binding = 3, Type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
-        ///     Scene material buffer: Set = 3, Binding = 4, Type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
-        ///     Scene texture array: Set = 3, Binding = 5, Type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
-        ///     Output storage image: Set = 4, Binding = 0, Type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+        ///     Camera matrix (struct CameraMatrices): Set = 0, Binding = 0, Type =
+        ///     VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC Model matrix (mat4): Set = 1, Binding = 0, Type =
+        ///     VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC Material params (struct MaterialParams): Set = 2, Binding = 0,
+        ///     Type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER Material diffuse texture: Set = 2, Binding = 1, Type =
+        ///     VK_DESCRIPTOR_TYPE_STORAGE_IMAGE Material specular texture: Set = 2, Binding = 2, Type =
+        ///     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER Material ambient texture: Set = 2, Binding = 3, Type =
+        ///     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER Material emission texture: Set = 2, Binding = 4, Type =
+        ///     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER Material normal texture: Set = 2, Binding = 5, Type =
+        ///     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER Acceleration structure: Set = 3, Binding = 0, Type =
+        ///     VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR Storage output image: Set = 3, Binding = 1, Type =
+        ///     VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER Scene vertex buffer: Set = 3, Binding = 2, Type =
+        ///     VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER Scene index buffer: Set = 3, Binding = 3, Type =
+        ///     VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER Scene material buffer: Set = 3, Binding = 4, Type =
+        ///     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER Scene texture array: Set = 3, Binding = 5, Type =
+        ///     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER Output storage image: Set = 4, Binding = 0, Type =
+        ///     VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
         ///
         ///     NB: Set 3 and 4 is only available when using ray tracing
         ///
@@ -345,6 +358,7 @@ namespace Mandrill
         /// <returns>Pointer to layout</returns>
         MANDRILL_API ptr<Layout> getLayout();
 
+        MANDRILL_API void loadNeuralModel(const std::filesystem::path& modelPath);
         /// <summary>
         /// Get the list of all nodes in the scene.
         /// </summary>
@@ -468,9 +482,26 @@ namespace Mandrill
             mpEnvironmentMap = pTexture;
         }
 
+        MANDRILL_API bool hasNeuralModel()
+        {
+            return mHasNeuralModel;
+        }
+
     private:
         friend Node;
+        // NTC Additions
+        SafetensorsModelData mNeuralModelData;
+        bool mHasNeuralModel = false;
+        std::filesystem::path mNeuralModelPath;
+        ptr<Sampler> m_pLastSetSamplerInScene;
 
+        ptr<Buffer> mpPaletteBuffer;
+        // ptr<Buffer> mpVQCodebookBuffer; // Add later
+        // ptr<Buffer> mpMLPAllWeightsBuffer; // Add later
+        // ptr<Buffer> mpMLPAllBiasesBuffer;  // Add later
+        // ptr<Buffer> mpCSAllBuffer;         // Add later
+
+        // NTC additions end
         void addTexture(std::string texturePath);
         void createDescriptors();
 

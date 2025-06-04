@@ -72,7 +72,8 @@ void Node::render(VkCommandBuffer cmd, const ptr<Camera> pCamera, const ptr<cons
 }
 
 Scene::Scene(ptr<Device> pDevice, ptr<Swapchain> pSwapchain, bool supportRayTracing)
-    : mpDevice(pDevice), mpSwapchain(pSwapchain), mSupportRayTracing(supportRayTracing), mVertexCount(0), mIndexCount(0)
+    : mpDevice(pDevice), mpSwapchain(pSwapchain), mSupportRayTracing(supportRayTracing), mVertexCount(0),
+      mIndexCount(0), mHasNeuralModel(false), m_pLastSetSamplerInScene(nullptr)
 {
     const uint8_t data[] = {0xff, 0x00, 0xff, 0xff, 0x88, 0x00, 0xff, 0xff,
                             0x88, 0x00, 0xff, 0xff, 0xff, 0x00, 0xff, 0xff};
@@ -122,6 +123,41 @@ uint32_t Scene::addMaterial(Material material)
     mMaterials.push_back(material);
 
     return count(mMaterials) - 1;
+}
+
+void Scene::loadNeuralModel(const std::filesystem::path& modelPath)
+{
+    if (modelPath.empty()) {
+        Log::Warning("Neural model path is empty. Skipping loading.");
+        mHasNeuralModel = false;
+        return;
+    }
+
+    Log::Info("Loading neural model from {}", modelPath.string());
+    if (::load_model_from_safetensors(modelPath.string(), mNeuralModelData)) { // Use global namespace for your loader
+        mHasNeuralModel = true;
+        mNeuralModelPath = modelPath; // Store for potential reloads
+        Log::Info("Successfully loaded neural model: {}", modelPath.string());
+        // print_model_data_summary(mNeuralModelData); // Optional: for debugging
+
+        // This assumes mMaterials is already populated by addMeshFromFile
+        for (auto& mat : mMaterials) {
+            // Ensure mat.name is populated correctly from tinyobj::material_t::name
+            if (mNeuralModelData.materials.count(mat.name)) {
+                mat.isNeuralTexture = true;
+                mat.pCpuNeuralMaterialData = &mNeuralModelData.materials.at(mat.name);
+                mat.params.isNeuralTexture = 1; // For UBO
+                Log::Info("Linked OBJ material '{}' to neural material ID '{}'", mat.name,
+                          mat.pCpuNeuralMaterialData->id);
+            } else {
+                mat.params.isNeuralTexture = 0; // Default for non-neural / non-linked materials
+            }
+        }
+
+    } else {
+        Log::Error("Failed to load neural model: {}", modelPath.string());
+        mHasNeuralModel = false;
+    }
 }
 
 uint32_t Scene::addMesh(const std::vector<Vertex> vertices, const std::vector<uint32_t> indices, uint32_t materialIndex)
@@ -297,6 +333,9 @@ std::vector<uint32_t> Scene::addMeshFromFile(const std::filesystem::path& path,
     // Load materials
     for (auto& material : materials) {
         Material mat;
+        mat.name = material.name;
+        mat.params.isNeuralTexture = 0;
+
         mat.params.diffuse.r = material.diffuse[0];
         mat.params.diffuse.g = material.diffuse[1];
         mat.params.diffuse.b = material.diffuse[2];
@@ -321,8 +360,9 @@ std::vector<uint32_t> Scene::addMeshFromFile(const std::filesystem::path& path,
                                                      std::string textureName, ptr<Texture> pMissingTexture,
                                                      std::string& textureKey) {
             if (!textureName.empty()) {
-                auto fullPath =
-                    std::filesystem::canonical(path.parent_path() / materialPath.relative_path() / textureName);
+                std::replace(textureName.begin(), textureName.end(), '\\', '/');
+
+                auto fullPath = std::filesystem::canonical(path.parent_path() / textureName);
                 textureKey = fullPath.string();
                 addTexture(textureKey);
                 return true;
@@ -351,6 +391,7 @@ std::vector<uint32_t> Scene::addMeshFromFile(const std::filesystem::path& path,
         }
 
         mMaterials.push_back(mat);
+        mMaterials.back().name = material.name;
     }
 
     // Add to statistics
@@ -465,6 +506,115 @@ void Scene::compile()
         }
     }
 
+    if (mHasNeuralModel) {
+        // 1. Palette Buffer
+        if (!mNeuralModelData.palette.values.empty()) {
+            VkDeviceSize paletteBufferSize = sizeof(float) * mNeuralModelData.palette.values.size();
+            if (paletteBufferSize > 0) {
+                mpPaletteBuffer =
+                    make_ptr<Buffer>(mpDevice, paletteBufferSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT); // Or DEVICE_LOCAL + staging
+                mpPaletteBuffer->copyFromHost(mNeuralModelData.palette.values.data(), paletteBufferSize, 0);
+                Log::Info("Uploaded palette buffer to GPU: {} floats", mNeuralModelData.palette.values.size());
+            }
+        }
+
+        // VQ Codebook, MLP Weights, etc., would be created here similarly later.
+
+        // Create VQ Grid Textures for relevant materials
+        for (auto& mat : mMaterials) {
+            if (mat.isNeuralTexture &&
+                mat.pCpuNeuralMaterialData) { // mat.isNeuralTexture already set by loadNeuralModel
+                                              // Check if the model globally uses VQ AND this material has VQ grids.
+                                              // The current SafetensorsModelData structure implies uses_vq is global.
+                // Feature grids are named like "materialID_level_X_grid_Y_vq_indices_uint8"
+                bool material_uses_vq_grids = false; // Determine this based on grid names for this material
+
+                for (const auto& fg_pair : mNeuralModelData.named_feature_grids) {
+                    const auto& fgd = fg_pair.second;
+                    if (fgd.base_feature_key == mat.name && fgd.name.find("_vq_indices_uint8") != std::string::npos) {
+                        material_uses_vq_grids = true;
+                        break;
+                    }
+                }
+
+                if (material_uses_vq_grids) { // Only create VQ grids if this material actually uses them
+                    for (const auto& fg_pair : mNeuralModelData.named_feature_grids) {
+                        const auto& fgd = fg_pair.second;
+                        if (fgd.base_feature_key == mat.name &&
+                            fgd.name.find("_vq_indices_uint8") != std::string::npos) {
+                            if (fgd.level_idx >= 0 && fgd.level_idx < MAX_NEURAL_FEATURE_GRID_LEVELS &&
+                                fgd.grid_type >= 0 && fgd.grid_type < 2) { // grid_type 0 or 1
+
+                                if (fgd.shape.size() >= 2) { // Expecting [height, width] at least
+                                    uint32_t width =
+                                        static_cast<uint32_t>(fgd.shape[1]); // Assuming shape[0]=height, shape[1]=width
+                                    uint32_t height = static_cast<uint32_t>(fgd.shape[0]);
+
+                                    if (width > 0 && height > 0 && !fgd.data_uint8.empty() &&
+                                        fgd.data_uint8.size() == width * height) {
+                                        // Texture constructor: device, type, format, data, width, height, depth,
+                                        // bytes_per_pixel, generate_mips
+                                        ptr<Texture> pGridTexture =
+                                            make_ptr<Texture>(mpDevice, Texture::Type::Texture2D, VK_FORMAT_R8_UINT,
+                                                              fgd.data_uint8.data(), width, height, 1, 1, false);
+
+                                        if (m_pLastSetSamplerInScene) {
+                                            pGridTexture->setSampler(m_pLastSetSamplerInScene);
+                                        } else {
+                                            Log::Error(
+                                                "Critical: m_pLastSetSamplerInScene is null in Scene::compile(). "
+                                                "Neural grid textures will not have a sampler. Ensure "
+                                                "Scene::setSampler was called.");
+                                        }
+
+                                        mat.neuralVQGrids[{fgd.level_idx, fgd.grid_type}] = pGridTexture;
+                                        mat.neuralVQGridShapes[{fgd.level_idx, fgd.grid_type}] =
+                                            glm::ivec2(width, height);
+                                        Log::Info("Created VQ grid texture for material '{}', L{}G{}, {}x{}", mat.name,
+                                                  fgd.level_idx, fgd.grid_type, width, height);
+                                    } else {
+                                        Log::Warning("VQ grid for material '{}', L{}G{} has invalid dims ({}x{}) or "
+                                                     "data size ({}). Skipping.",
+                                                     mat.name, fgd.level_idx, fgd.grid_type, width, height,
+                                                     fgd.data_uint8.size());
+                                    }
+                                } else {
+                                    Log::Warning("VQ grid for material '{}', L{}G{} has insufficient shape dimensions "
+                                                 "({}). Skipping.",
+                                                 mat.name, fgd.level_idx, fgd.grid_type, fgd.shape.size());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+
+    // Associate each material with a part of the material params buffer
+    MaterialParams* materialParams_ptr = static_cast<MaterialParams*>(mpMaterialParams->getHostMap());
+    for (uint32_t i = 0; i < count(mMaterials); i++) {
+        mMaterials[i].paramsDevice = materialParams_ptr + i;
+        // mMaterials[i].params.isNeuralTexture is already set if linked in loadNeuralModel
+        // If not linked, it should be 0.
+        if (!mMaterials[i].isNeuralTexture)
+            mMaterials[i].params.isNeuralTexture = 0;
+
+        *(mMaterials[i].paramsDevice) =
+            mMaterials[i].params; // This copies the potentially updated isNeuralTexture flag
+        mMaterials[i].paramsOffset = Helpers::alignTo(i * sizeof(MaterialParams), alignment);
+    }
+
+    // ... (rest of the existing compile function, like ray tracing buffers) ...
+
+    if (!mSupportRayTracing) { // Or always, if descriptors are needed before/without AS build
+        createDescriptors();
+    }
+
+
     if (!mSupportRayTracing) {
         createDescriptors();
     }
@@ -536,10 +686,24 @@ void Scene::bindRayTracingDescriptors(VkCommandBuffer cmd, ptr<Camera> pCamera, 
 
 void Scene::setSampler(const ptr<Sampler> pSampler)
 {
+    m_pLastSetSamplerInScene = pSampler;
     mpMissingTexture->setSampler(pSampler);
 
-    for (auto& texture : mTextures) {
-        texture.second->setSampler(pSampler);
+    for (auto& texture_pair : mTextures) { // std::unordered_map<std::string, ptr<Texture>>
+        texture_pair.second->setSampler(pSampler);
+    }
+
+    // Also apply sampler to neural VQ grid textures
+    if (mHasNeuralModel) {
+        for (auto& mat : mMaterials) {
+            if (mat.isNeuralTexture) {
+                for (auto& vq_grid_pair : mat.neuralVQGrids) {
+                    if (vq_grid_pair.second) {
+                        vq_grid_pair.second->setSampler(pSampler);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -565,8 +729,20 @@ ptr<Layout> Scene::getLayout()
     desc.emplace_back(2, 3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_ALL_GRAPHICS);
     desc.emplace_back(2, 4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_ALL_GRAPHICS);
     desc.emplace_back(2, 5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_ALL_GRAPHICS);
+
+    // Bindings for Neural VQ Grids (usampler2D in shader) - up to MAX_LEVELS * 2 grids
+    // Example: L0G0, L0G1, L1G0, L1G1, ...
+    uint32_t currentBinding = 6;
+    for (int level = 0; level < MAX_NEURAL_FEATURE_GRID_LEVELS; ++level) {
+        for (int grid_type = 0; grid_type < 2; ++grid_type) {
+            desc.emplace_back(2, currentBinding++, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                              VK_SHADER_STAGE_FRAGMENT_BIT);
+        }
+    }
+
     desc.emplace_back(3, 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                       VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_MISS_BIT_KHR);
+    desc.emplace_back(3, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT); // Palette Buffer
 
     if (mSupportRayTracing) {
         // 4.0: Acceleration structure
@@ -637,19 +813,54 @@ void Scene::createDescriptors()
         desc.emplace_back(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, mTextures[mat.emissionTexturePath]);
         desc.emplace_back(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, mTextures[mat.normalTexturePath]);
 
+        // Add descriptors for neural VQ grids
+        if (mat.isNeuralTexture) {
+            for (int level = 0; level < MAX_NEURAL_FEATURE_GRID_LEVELS; ++level) {
+                for (int grid_type = 0; grid_type < 2; ++grid_type) {
+                    auto key = std::make_pair(level, grid_type);
+                    if (mat.neuralVQGrids.count(key) && mat.neuralVQGrids[key]) {
+                        desc.emplace_back(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, mat.neuralVQGrids[key]);
+                    } else {
+                        desc.emplace_back(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, mpMissingTexture);
+                    }
+                }
+            }
+        } else {
+            // If not a neural texture, fill the VQ grid slots with missing texture
+            for (int i = 0; i < MAX_NEURAL_FEATURE_GRID_LEVELS * 2; ++i) {
+                desc.emplace_back(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, mpMissingTexture);
+            }
+        }
         // Set layout for set 2
         auto layout = pLayout->getDescriptorSetLayouts()[2];
         mat.pDescriptor = std::make_unique<Descriptor>(mpDevice, desc, layout);
     }
 
+    std::vector<DescriptorDesc> desc;
     // Environment map
     if (mpEnvironmentMap) {
-        std::vector<DescriptorDesc> desc;
         desc.emplace_back(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, mpEnvironmentMap);
 
         // Set layout for set 3
         auto layout = pLayout->getDescriptorSetLayouts()[3];
         mpEnvironmentMapDescriptor = std::make_unique<Descriptor>(mpDevice, desc, layout);
+    }
+
+    if (mHasNeuralModel && mpPaletteBuffer) {
+
+        if (!mpEnvironmentMap && desc.empty()) {
+            desc.emplace_back(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                              mpMissingTexture); // Dummy for binding 0
+        }
+        desc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, mpPaletteBuffer);
+    }
+
+    if (pLayout->getDescriptorSetLayouts().size() > 3) {
+        auto layoutSet3 = pLayout->getDescriptorSetLayouts()[3];
+        if (mpEnvironmentMapDescriptor)
+            mpEnvironmentMapDescriptor.reset(); // Clear old one if any
+        mpEnvironmentMapDescriptor = std::make_unique<Descriptor>(mpDevice, desc, layoutSet3);
+        Log::Info("Created descriptor for set 3 (EnvMap/Neural Globals)");
     }
 
     // Add extra descriptors for ray tracing (set 4)

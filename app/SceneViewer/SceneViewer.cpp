@@ -24,6 +24,23 @@ public:
         // Load meshes from the scene path
         auto meshIndices = mpScene->addMeshFromFile(mScenePath);
 
+
+        // Load neural model if path is set
+        if (!mNeuralModelPath.empty()) {
+            mpScene->loadNeuralModel(mNeuralModelPath);
+        } else {
+            // Try to autodetect: <obj_filename_stem>.safetensors
+            std::filesystem::path autoNeuralPath = mScenePath;
+            autoNeuralPath.replace_extension(".safetensors");
+            if (std::filesystem::exists(autoNeuralPath)) {
+                Log::Info("Auto-detected neural model: {}", autoNeuralPath.string());
+                mNeuralModelPath = autoNeuralPath;
+                mpScene->loadNeuralModel(mNeuralModelPath);
+            } else {
+                Log::Warning("Neural model path not set and auto-detection failed for: {}", autoNeuralPath.string());
+            }
+        }
+
         // Add a node to the scene
         std::shared_ptr<Node> pNode = mpScene->addNode();
         pNode->setPipeline(mPipelines[PIPELINE_FILL]);
@@ -136,7 +153,7 @@ public:
             }
 
             PushConstants pushConstants = {
-                .renderMode = 9,
+                .renderMode = 10,
                 .discardOnZeroAlpha = mDiscardOnZeroAlpha,
                 .lineColor = mLineColor,
             };
@@ -176,10 +193,38 @@ public:
             }
 
             ImGui::Text("Scene: %s", mScenePath.string().c_str());
+
+            // UI for Neural Model Path
+            char neuralPathBuf[1024];
+            strncpy(neuralPathBuf, mNeuralModelPath.string().c_str(), sizeof(neuralPathBuf) - 1);
+            neuralPathBuf[sizeof(neuralPathBuf) - 1] = 0; // Null terminate
+
+            if (ImGui::InputText("Neural Model (.safetensors)", neuralPathBuf, sizeof(neuralPathBuf),
+                                 ImGuiInputTextFlags_EnterReturnsTrue)) {
+                mNeuralModelPath = neuralPathBuf;
+                if (!mScenePath.empty() && !mNeuralModelPath.empty()) { // Only reload if both paths are set
+                    loadScene();                                        // Reload scene with new neural model
+                } else if (mNeuralModelPath.empty() && mpScene && mpScene->hasNeuralModel()) {
+                    // If path cleared, effectively remove neural model
+                    loadScene();
+                }
+            }
+            if (ImGui::Button("Browse Neural Model")) {
+                std::filesystem::path tempNeuralPath =
+                    OpenFile(mpWindow, "Safetensors (*.safetensors)\0*.safetensors\0All\0*.*\0");
+                if (!tempNeuralPath.empty()) {
+                    mNeuralModelPath = tempNeuralPath;
+                    if (!mScenePath.empty()) { // Only reload if OBJ is also loaded
+                        loadScene();
+                    }
+                }
+            }
+
             const char* renderModes[] = {
                 "Diffuse",  "Specular",  "Ambient",
                 "Emission", "Shininess", "Index of refraction",
                 "Opacity",  "Normal",    "Texture coordinates",
+                "NTC",
             };
             ImGui::Combo("Render mode", &mRenderMode, renderModes, IM_ARRAYSIZE(renderModes));
             const char* frontFace[] = {"Counter clockwise", "Clockwise"};
@@ -259,6 +304,7 @@ private:
 
     std::shared_ptr<Scene> mpScene;
     std::filesystem::path mScenePath;
+    std::filesystem::path mNeuralModelPath;
 
     int mRenderMode = 0;
     bool mDiscardOnZeroAlpha = false;

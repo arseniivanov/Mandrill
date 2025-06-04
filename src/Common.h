@@ -177,7 +177,17 @@ namespace Mandrill
 
 #elif MANDRILL_LINUX
         char filename[1024];
-        FILE* f = popen("zenity --file-selection --modal --title=\"Select file\"", "r");
+        char current_dir_cstr[1024]; // Or use PATH_MAX from <limits.h> for more robustness
+        getcwd(current_dir_cstr, sizeof(current_dir_cstr));
+        std::string command = "zenity --file-selection --modal --title=\"Select file\" --filename=\"";
+        command += current_dir_cstr;
+
+        if (command.back() != '/') {
+            command += "/";
+        }
+        command += "\"";
+
+        FILE* f = popen(command.c_str(), "r");
 
         if (f) {
             fgets(filename, sizeof(filename), f);

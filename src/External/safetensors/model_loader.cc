@@ -1,0 +1,377 @@
+#define SAFETENSORS_CPP_IMPLEMENTATION
+#include "model_loader.h"
+
+// Define SAFETENSORS_CPP_IMPLEMENTATION in exactly one .cc file
+// This is now handled by safetensors.hh when SAFETENSORS_CPP_IMPLEMENTATION is
+// defined before including it. No, it should be here if model_loader.cpp is the
+// one .cc file defining it. If main.cpp defines it, then remove from here.
+// Let's assume main.cpp defines it for now. #define
+// SAFETENSORS_CPP_IMPLEMENTATION // Will be in main.cpp
+
+// --- Constructor Implementations ---
+FeatureGridData::FeatureGridData(const std::string& n) : name(n)
+{
+}
+
+MLPLayer::MLPLayer() : weights_dtype(safetensors::dtype::kFLOAT32), bias_dtype(safetensors::dtype::kFLOAT32)
+{ // Default to something, will
+  // be overwritten
+  // kFLOAT32 is just a placeholder; it gets set from the tensor.
+  // Using kBOOL or similar as "NONE" could also work if needed, but the
+  // safetensors.hh doesn't seem to have an explicit NONE/UNDEFINED dtype. Check
+  // if bias_raw_bytes is empty to see if bias exists.
+}
+SafetensorsModelData::SafetensorsModelData() : uses_vq(false), uses_combined_features(false), max_level_idx(-1)
+{
+}
+
+// --- Helper functions for parsing tensor names (same as before) ---
+bool parse_mlp_tensor_name(const std::string& name, std::string& material_id, int& layer_idx, bool& is_weights)
+{
+    static const std::regex mlp_regex("mlp_([a-zA-Z0-9_\\.\\-]+)_layer_(\\d+)_(weights|bias)");
+    std::smatch match;
+    if (std::regex_match(name, match, mlp_regex)) {
+        material_id = match[1].str();
+        layer_idx = std::stoi(match[2].str());
+        is_weights = (match[3].str() == "weights");
+        return true;
+    }
+    return false;
+}
+
+bool parse_channel_selection_name(const std::string& name, std::string& material_id, int& level_idx,
+                                  int& grid_type_0or1)
+{
+    static const std::regex sel_regex("([a-zA-Z0-9_\\.\\-]+)_level_(\\d+)_grid(0|1)_channel_selection_uint16");
+    std::smatch match;
+    if (std::regex_match(name, match, sel_regex)) {
+        material_id = match[1].str();
+        level_idx = std::stoi(match[2].str());
+        grid_type_0or1 = std::stoi(match[3].str());
+        return true;
+    }
+    return false;
+}
+
+void parse_feature_grid_name_details(FeatureGridData& fgd)
+{
+    static const std::regex vq_grid_regex("([a-zA-Z0-9_\\.\\-]+)_level_(\\d+)_grid_(\\d+)_vq_indices_uint8");
+    static const std::regex raw_packed_grid_regex("packed_feature_grid_([a-zA-Z0-9_\\.\\-]+)_L(\\d+)_G(\\d+)_ch(\\d+)_"
+                                                  "uint8");
+    std::smatch match;
+
+    if (std::regex_match(fgd.name, match, vq_grid_regex)) {
+        fgd.base_feature_key = match[1].str();
+        fgd.level_idx = std::stoi(match[2].str());
+        fgd.grid_type = std::stoi(match[3].str());
+    } else if (std::regex_match(fgd.name, match, raw_packed_grid_regex)) {
+        fgd.base_feature_key = match[1].str();
+        fgd.level_idx = std::stoi(match[2].str());
+        fgd.grid_type = std::stoi(match[3].str());
+        fgd.channel_idx = std::stoi(match[4].str());
+    }
+}
+
+// Helper to copy data from safetensors_t storage
+void copy_tensor_data(std::vector<uint8_t>& dest, const safetensors::safetensors_t& st_data,
+                      const safetensors::tensor_t& tensor_info)
+{
+    size_t start_offset = tensor_info.data_offsets[0];
+    size_t end_offset = tensor_info.data_offsets[1];
+    size_t byte_length = end_offset - start_offset;
+
+    if (byte_length == 0) {
+        dest.clear();
+        return;
+    }
+
+    const uint8_t* data_source_ptr = nullptr;
+    size_t source_total_size = 0;
+
+    if (st_data.mmaped) {
+        data_source_ptr = st_data.databuffer_addr;
+        source_total_size = st_data.databuffer_size;
+    } else {
+        data_source_ptr = st_data.storage.data();
+        source_total_size = st_data.storage.size();
+    }
+
+    if (!data_source_ptr) {
+        std::cerr << "Error: Data source pointer is null." << std::endl;
+        dest.clear();
+        return;
+    }
+
+    if (end_offset > source_total_size) {
+        std::cerr << "Error: Tensor data_offsets [" << start_offset << ", " << end_offset
+                  << "] exceed data buffer size " << source_total_size << std::endl;
+        dest.clear();
+        return;
+    }
+
+    dest.resize(byte_length);
+    std::memcpy(dest.data(), data_source_ptr + start_offset, byte_length);
+}
+
+// --- Main Loading Function ---
+bool load_model_from_safetensors(const std::string& filename, SafetensorsModelData& model_data)
+{
+    safetensors::safetensors_t st_data; // Changed from SafeTensors to safetensors_t
+    std::string warn, err;
+
+    // Using load_from_file which populates st_data.storage
+    bool ret = safetensors::load_from_file(filename, &st_data, &warn, &err);
+
+    if (!warn.empty()) {
+        std::cout << "SAFETENSORS WARN: " << warn << "\n";
+    }
+    if (!ret) {
+        std::cerr << "Failed to load safetensors file: " << filename << "\n";
+        if (!err.empty())
+            std::cerr << "  ERR: " << err << "\n";
+        return false;
+    }
+
+    // Example of how you might check metadata if Python saved it in
+    // st_data.metadata (Using ordered_dict<std::string> st_data.metadata;)
+    // std::string uses_vq_str;
+    // if (st_data.metadata.at("uses_vq_codebook", &uses_vq_str)) { // Check for
+    // key existence
+    //    model_data.uses_vq = (uses_vq_str == "True");
+    // }
+
+    // Iterate through tensors using the ordered_dict interface
+    const auto& tensor_keys = st_data.tensors.keys();
+    for (const std::string& name : tensor_keys) {
+        safetensors::tensor_t tensor_info;
+        if (!st_data.tensors.at(name, &tensor_info)) {
+            std::cerr << "Error: Could not retrieve tensor info for key: " << name << std::endl;
+            continue;
+        }
+
+        if (name == "vq_codebook_palette_float32") {
+            if (tensor_info.dtype != safetensors::dtype::kFLOAT32) {
+                std::cerr << "Error: Palette tensor '" << name << "' has unexpected dtype. Expected F32." << std::endl;
+                continue;
+            }
+            std::vector<uint8_t> raw_palette_data;
+            copy_tensor_data(raw_palette_data, st_data, tensor_info);
+            if (raw_palette_data.size() % sizeof(float) != 0) {
+                std::cerr << "Error: Palette data size not multiple of float size." << std::endl;
+                continue;
+            }
+            size_t num_elements = raw_palette_data.size() / sizeof(float);
+            model_data.palette.values.resize(num_elements);
+            std::memcpy(model_data.palette.values.data(), raw_palette_data.data(), raw_palette_data.size());
+        } else if (name == "vq_codebook_patches_packed_uint8") {
+            if (tensor_info.dtype != safetensors::dtype::kUINT8) {
+                std::cerr << "Error: VQ Codebook tensor '" << name << "' has unexpected dtype. Expected U8."
+                          << std::endl;
+                continue;
+            }
+            copy_tensor_data(model_data.vq_codebook.packed_data, st_data, tensor_info);
+            model_data.vq_codebook.shape = tensor_info.shape;
+            model_data.uses_vq = true;
+        } else if (name.rfind("mlp_", 0) == 0) { // Starts with "mlp_"
+            std::string material_id_mlp;
+            int layer_idx_mlp;
+            bool is_weights_mlp;
+            if (parse_mlp_tensor_name(name, material_id_mlp, layer_idx_mlp, is_weights_mlp)) {
+                MaterialSpecificData& mat_data = model_data.materials[material_id_mlp];
+                if (mat_data.id.empty())
+                    mat_data.id = material_id_mlp;
+
+                MLPLayer* layer_ptr = nullptr;
+                auto it = std::find_if(mat_data.mlp_layers.begin(), mat_data.mlp_layers.end(),
+                                       [layer_idx_mlp](const MLPLayer& l) { return l.layer_idx == layer_idx_mlp; });
+                if (it == mat_data.mlp_layers.end()) {
+                    mat_data.mlp_layers.emplace_back();
+                    layer_ptr = &mat_data.mlp_layers.back();
+                    layer_ptr->material_id = material_id_mlp;
+                    layer_ptr->layer_idx = layer_idx_mlp;
+                } else {
+                    layer_ptr = &(*it);
+                }
+
+                if (is_weights_mlp) {
+                    copy_tensor_data(layer_ptr->weights_raw_bytes, st_data, tensor_info);
+                    layer_ptr->weights_shape = tensor_info.shape;
+                    layer_ptr->weights_dtype = tensor_info.dtype;
+                } else { // Bias
+                    copy_tensor_data(layer_ptr->bias_raw_bytes, st_data, tensor_info);
+                    layer_ptr->bias_shape = tensor_info.shape;
+                    layer_ptr->bias_dtype = tensor_info.dtype;
+                }
+            } else {
+                std::cout << "Warning: Could not parse MLP tensor name: " << name << std::endl;
+            }
+        } else if (name.find("_channel_selection_uint16") != std::string::npos) {
+            std::string material_id_sel;
+            int level_idx_sel;
+            int grid_type_sel;
+            if (parse_channel_selection_name(name, material_id_sel, level_idx_sel, grid_type_sel)) {
+                if (tensor_info.dtype != safetensors::dtype::kUINT16) {
+                    std::cerr << "Error: Channel selection tensor '" << name << "' has unexpected dtype. Expected U16."
+                              << std::endl;
+                    continue;
+                }
+                MaterialSpecificData& mat_data = model_data.materials[material_id_sel];
+                if (mat_data.id.empty())
+                    mat_data.id = material_id_sel;
+
+                ChannelSelections& sels = mat_data.level_channel_selections[level_idx_sel];
+
+                std::vector<uint8_t> raw_selection_data;
+                copy_tensor_data(raw_selection_data, st_data, tensor_info);
+                if (raw_selection_data.size() % sizeof(uint16_t) != 0) {
+                    std::cerr << "Error: Channel selection data size not multiple of "
+                                 "uint16_t size for "
+                              << name << std::endl;
+                    continue;
+                }
+                size_t num_elements = raw_selection_data.size() / sizeof(uint16_t);
+
+                std::vector<uint16_t>* target_vec =
+                    (grid_type_sel == 0) ? &sels.grid0_selected_channels : &sels.grid1_selected_channels;
+                target_vec->resize(num_elements);
+                std::memcpy(target_vec->data(), raw_selection_data.data(), raw_selection_data.size());
+
+                model_data.max_level_idx = std::max(model_data.max_level_idx, level_idx_sel);
+            } else {
+                std::cout << "Warning: Could not parse channel selection tensor name: " << name << std::endl;
+            }
+        } else if (name.find("_vq_indices_uint8") != std::string::npos || name.rfind("packed_feature_grid_", 0) == 0) {
+            if (tensor_info.dtype != safetensors::dtype::kUINT8) {
+                std::cerr << "Error: Feature grid tensor '" << name << "' has unexpected dtype. Expected U8."
+                          << std::endl;
+                continue;
+            }
+            FeatureGridData fgd(name);
+            copy_tensor_data(fgd.data_uint8, st_data, tensor_info);
+            fgd.shape = tensor_info.shape;
+            parse_feature_grid_name_details(fgd); // Parse after getting name
+            model_data.named_feature_grids[name] = fgd;
+
+            if (!fgd.base_feature_key.empty()) {
+                bool is_material_key = false;
+                for (const auto& mat_p : model_data.materials) { // Check if base_feature_key is an existing
+                                                                 // material ID
+                    if (mat_p.first == fgd.base_feature_key) {
+                        is_material_key = true;
+                        break;
+                    }
+                }
+                // A simpler heuristic: if the base_feature_key contains "shared" or
+                // doesn't match known material patterns. For now, let's assume if it's
+                // not explicitly a material, it might be shared. The most robust way is
+                // metadata from Python.
+                if (fgd.base_feature_key.find("shared") != std::string::npos ||
+                    !is_material_key) { // Simplified heuristic
+                    if (model_data.combined_feature_key_name.empty()) {
+                        model_data.combined_feature_key_name = fgd.base_feature_key;
+                        model_data.uses_combined_features = true;
+                    } else if (model_data.combined_feature_key_name != fgd.base_feature_key) {
+                        // As before, this implies multiple shared keys, sticking to the
+                        // first.
+                    }
+                }
+            }
+            if (fgd.level_idx != -1) {
+                model_data.max_level_idx = std::max(model_data.max_level_idx, fgd.level_idx);
+            }
+        } else {
+            std::cout << "Info: Unhandled tensor: " << name << std::endl;
+        }
+    }
+
+    // Final check on combined_features based on what was found
+    if (model_data.combined_feature_key_name.empty() && !model_data.named_feature_grids.empty()) {
+        // If no combined_feature_key_name was set but grids exist, assume
+        // per-material
+        model_data.uses_combined_features = false;
+    } else if (!model_data.combined_feature_key_name.empty()) {
+        model_data.uses_combined_features = true;
+    }
+
+    return true;
+}
+
+void print_model_data_summary(const SafetensorsModelData& data)
+{
+    std::cout << "\n--- Loaded Safetensors Model Summary ---" << std::endl;
+    std::cout << "Palette values (" << data.palette.values.size() << "): ";
+    for (float v : data.palette.values)
+        std::cout << v << " ";
+    std::cout << std::endl;
+
+    std::cout << "Uses VQ: " << (data.uses_vq ? "Yes" : "No") << std::endl;
+    if (data.uses_vq && !data.vq_codebook.packed_data.empty()) {
+        std::cout << "  VQ Codebook shape: [";
+        for (size_t i = 0; i < data.vq_codebook.shape.size(); ++i)
+            std::cout << data.vq_codebook.shape[i] << (i == data.vq_codebook.shape.size() - 1 ? "" : ", ");
+        std::cout << "], Data size: " << data.vq_codebook.packed_data.size() << " bytes" << std::endl;
+    }
+
+    std::cout << "Uses Combined Features: " << (data.uses_combined_features ? "Yes" : "No") << std::endl;
+    if (data.uses_combined_features) {
+        std::cout << "  Combined Feature Key Name: " << data.combined_feature_key_name << std::endl;
+    }
+    std::cout << "Max Feature Level Index Found: " << data.max_level_idx << std::endl;
+
+    std::cout << "\nFeature Grids (" << data.named_feature_grids.size() << " total):" << std::endl;
+    for (const auto& pair : data.named_feature_grids) {
+        const FeatureGridData& fgd = pair.second;
+        std::cout << "  - Name: " << fgd.name << ", Shape: [";
+        for (size_t i = 0; i < fgd.shape.size(); ++i)
+            std::cout << fgd.shape[i] << (i == fgd.shape.size() - 1 ? "" : ", ");
+        std::cout << "], Data size: " << fgd.data_uint8.size() << " bytes" << std::endl;
+        std::cout << "    Parsed: base_key='" << fgd.base_feature_key << "', L=" << fgd.level_idx
+                  << ", G=" << fgd.grid_type << ", ch=" << fgd.channel_idx << std::endl;
+    }
+
+    std::cout << "\nMaterials (" << data.materials.size() << " total):" << std::endl;
+    for (const auto& mat_pair : data.materials) {
+        const MaterialSpecificData& mat_data = mat_pair.second;
+        std::cout << "  Material ID: " << mat_data.id << std::endl;
+
+        std::cout << "    Channel Selections (by level):" << std::endl;
+        for (const auto& sel_pair : mat_data.level_channel_selections) {
+            std::cout << "      Level " << sel_pair.first << ":" << std::endl;
+            std::cout << "        Grid0 (" << sel_pair.second.grid0_selected_channels.size() << " indices): ";
+            if (sel_pair.second.grid0_selected_channels.empty())
+                std::cout << "(none)";
+            else
+                for (size_t i = 0; i < std::min(size_t(5), sel_pair.second.grid0_selected_channels.size()); ++i)
+                    std::cout << sel_pair.second.grid0_selected_channels[i] << " ";
+            if (sel_pair.second.grid0_selected_channels.size() > 5)
+                std::cout << "...";
+            std::cout << std::endl;
+
+            std::cout << "        Grid1 (" << sel_pair.second.grid1_selected_channels.size() << " indices): ";
+            if (sel_pair.second.grid1_selected_channels.empty())
+                std::cout << "(none)";
+            else
+                for (size_t i = 0; i < std::min(size_t(5), sel_pair.second.grid1_selected_channels.size()); ++i)
+                    std::cout << sel_pair.second.grid1_selected_channels[i] << " ";
+            if (sel_pair.second.grid1_selected_channels.size() > 5)
+                std::cout << "...";
+            std::cout << std::endl;
+        }
+
+        std::cout << "    MLP Layers (" << mat_data.mlp_layers.size() << " total):" << std::endl;
+        for (const auto& layer : mat_data.mlp_layers) {
+            std::cout << "      Layer " << layer.layer_idx << ": Weights shape [";
+            for (size_t i = 0; i < layer.weights_shape.size(); ++i)
+                std::cout << layer.weights_shape[i] << (i == layer.weights_shape.size() - 1 ? "" : ", ");
+            std::cout << "], Dtype: " << safetensors::get_dtype_str(layer.weights_dtype); // Use helper
+            if (!layer.bias_raw_bytes.empty()) {
+                std::cout << ", Bias shape [";
+                for (size_t i = 0; i < layer.bias_shape.size(); ++i)
+                    std::cout << layer.bias_shape[i] << (i == layer.bias_shape.size() - 1 ? "" : ", ");
+                std::cout << "], Dtype: " << safetensors::get_dtype_str(layer.bias_dtype);
+            }
+            std::cout << std::endl;
+        }
+    }
+    std::cout << "--- End of Summary ---" << std::endl;
+}

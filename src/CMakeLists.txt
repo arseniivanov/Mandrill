@@ -65,6 +65,7 @@ target_link_libraries(Mandrill
 	PUBLIC
 		${Vulkan_LIBRARIES}
 		glfw
+    mandrill_safetensors_loader
 )
 
 add_subdirectory(External)
@@ -72,3 +73,4 @@ add_subdirectory(External)
 include_directories(External/imgui)
 include_directories(External/stb)
 include_directories(External/tinyobjloader)
+include_directories(External/safetensors)

@@ -1,5 +1,8 @@
 #include "Mandrill.h"
 
+#include <filesystem> // C++17
+#include <string>
+
 using namespace Mandrill;
 
 class Assignment2 : public App
@@ -156,7 +159,9 @@ public:
         mpSampler = std::make_shared<Sampler>(mpDevice);
 
         // Load scene
-        auto meshIndices = mpScene->addMeshFromFile("D:\\scenes\\crytek_sponza\\sponza.obj");
+        auto meshIndices =
+            mpScene->addMeshFromFile("/home/arseni/repositories/ntc-renderer/Mandrill/res/sponza/sponza.obj",
+                                     "/home/arseni/repositories/ntc-renderer/Mandrill/res/sponza");
         std::shared_ptr<Node> pNode = mpScene->addNode();
         pNode->setPipeline(mPipelines[GBUFFER_PASS]); // Render scene with first pass pipeline
         for (auto meshIndex : meshIndices) {
