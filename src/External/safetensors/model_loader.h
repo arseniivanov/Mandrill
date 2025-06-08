@@ -97,7 +97,7 @@ struct SafetensorsModelData {
     std::map<std::string, FeatureGridData> named_feature_grids;
     std::map<std::string, MaterialSpecificData> materials;
 
-    bool uses_vq = false;
+    bool uses_vq = true;
     bool uses_combined_features = false;
     std::string combined_feature_key_name;
     int max_level_idx = -1;

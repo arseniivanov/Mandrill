@@ -37,11 +37,12 @@ Texture::Texture(ptr<Device> pDevice, Type type, VkFormat format, const std::fil
             return;
         }
 
-        create(format, pData, width, height, 1, sizeof(stbi_uc) * channels, mipmaps);
+        create(type, format, pData, width, height, 1, sizeof(stbi_uc) * channels, mipmaps);
 
         stbi_image_free(pData);
         break;
     }
+
     case Type::Texture3D: {
 #ifdef MANDRILL_USE_OPENVDB
         openvdb::io::File file(path.string());
@@ -100,28 +101,40 @@ Texture::Texture(ptr<Device> pDevice, Type type, VkFormat format, const void* pD
                  uint32_t depth, uint32_t channels, bool mipmaps)
     : mpDevice(pDevice), mImageInfo{0}
 {
-    create(format, pData, width, height, depth, channels, mipmaps);
+    if (type == Type::Texture2DArray) {
+        create_array(format, pData, width, height, depth, channels, mipmaps);
+    } else {
+        // All other types use the original create function
+        create(type, format, pData, width, height, depth, channels, mipmaps);
+    }
 }
 
 Texture::~Texture()
 {
 }
 
-void Texture::create(VkFormat format, const void* pData, uint32_t width, uint32_t height, uint32_t depth,
-                     uint32_t bytesPerPixel, bool mipmaps)
+void Texture::create_array(VkFormat format, const void* pData, uint32_t width, uint32_t height, uint32_t layerCount,
+                           uint32_t bytesPerPixel, bool mipmaps)
 {
-    uint32_t mipLevels = 1;
+    uint32_t mipLevels = 1; // Mipmapping for texture arrays is more complex, disable for now.
     if (mipmaps) {
-        mipLevels = static_cast<uint32_t>(std::floor(log2(std::max(width, height))) + 1);
+        Log::Warning("Mipmap generation for Texture2DArray is not fully supported yet. Disabling.");
+        mipmaps = false;
     }
 
+    // The 'depth' of a 2D array image is always 1.
+    uint32_t depth = 1;
+
+    // Use a hypothetical updated Image constructor. If yours is different, adapt this line.
+    // The key is to pass VK_IMAGE_TYPE_2D and the layerCount.
     mpImage = make_ptr<Image>(
         mpDevice, width, height, depth, mipLevels, VK_SAMPLE_COUNT_1_BIT, format, VK_IMAGE_TILING_OPTIMAL,
         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VK_IMAGE_TYPE_2D, layerCount // Pass the correct type and layer count
+    );
 
     if (pData) {
-        VkDeviceSize size = width * height * depth * bytesPerPixel;
+        VkDeviceSize size = width * height * depth * layerCount * bytesPerPixel;
 
         Buffer staging(mpDevice, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
@@ -129,19 +142,102 @@ void Texture::create(VkFormat format, const void* pData, uint32_t width, uint32_
         staging.copyFromHost(pData, size);
 
         Helpers::transitionImageLayout(mpDevice, mpImage->getImage(), format, VK_IMAGE_LAYOUT_UNDEFINED,
-                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, mipLevels);
+                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, mipLevels, layerCount);
+        // Use our new helper overload
+        Helpers::copyBufferToImage(mpDevice, staging.getBuffer(), mpImage->getImage(), width, height, depth,
+                                   layerCount);
 
-        Helpers::copyBufferToImage(mpDevice, staging.getBuffer(), mpImage->getImage(), width, height, depth);
+        Helpers::transitionImageLayout(mpDevice, mpImage->getImage(), format, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, mipLevels, layerCount);
+    }
+    // Create the image view with the correct 2D_ARRAY type
+    mpImage->createImageView(VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_VIEW_TYPE_2D_ARRAY);
+
+    mImageInfo = {
+        .sampler = nullptr,
+        .imageView = mpImage->getImageView(),
+        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+    };
+}
+
+// Add the 'type' parameter to the 'create' function signature
+void Texture::create(Type type, VkFormat format, const void* pData, uint32_t width, uint32_t height, uint32_t depth,
+                     uint32_t bytesPerPixel, bool mipmaps)
+{
+    uint32_t mipLevels = 1;
+    if (mipmaps) {
+        mipLevels = static_cast<uint32_t>(std::floor(log2(std::max(width, height))) + 1);
+    }
+
+    // --- MODIFICATION START ---
+    VkImageType imageType = VK_IMAGE_TYPE_2D;
+    VkImageViewType viewType = VK_IMAGE_VIEW_TYPE_2D;
+    uint32_t arrayLayers = 1;
+
+    // Set Vulkan types based on our enum
+    switch (type) {
+    case Type::Texture1D:
+        imageType = VK_IMAGE_TYPE_1D;
+        viewType = VK_IMAGE_VIEW_TYPE_1D;
+        break;
+    case Type::Texture2D:
+        imageType = VK_IMAGE_TYPE_2D;
+        viewType = VK_IMAGE_VIEW_TYPE_2D;
+        break;
+    case Type::Texture3D:
+        imageType = VK_IMAGE_TYPE_3D;
+        viewType = VK_IMAGE_VIEW_TYPE_3D;
+        break;
+    case Type::CubeMap:
+        imageType = VK_IMAGE_TYPE_2D;
+        viewType = VK_IMAGE_VIEW_TYPE_CUBE;
+        arrayLayers = 6;
+        break;
+    case Type::Texture2DArray:
+        imageType = VK_IMAGE_TYPE_2D;
+        viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+        // For a 2D array, 'depth' is used as the number of layers.
+        arrayLayers = depth;
+        depth = 1; // The depth of each layer is 1.
+        break;
+    }
+
+    // Pass the correct parameters to the Image constructor
+    mpImage = make_ptr<Image>(
+        mpDevice, width, height, depth, mipLevels, VK_SAMPLE_COUNT_1_BIT, format, VK_IMAGE_TILING_OPTIMAL,
+        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, imageType, arrayLayers // Pass the newly determined type and layer count
+    );
+    // --- MODIFICATION END ---
+
+
+    if (pData) {
+        // The size calculation must now account for array layers.
+        VkDeviceSize size = width * height * depth * arrayLayers * bytesPerPixel;
+
+        Buffer staging(mpDevice, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+        staging.copyFromHost(pData, size);
+
+        Helpers::transitionImageLayout(mpDevice, mpImage->getImage(), format, VK_IMAGE_LAYOUT_UNDEFINED,
+                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, mipLevels,
+                                       arrayLayers); // Pass arrayLayers
+
+        Helpers::copyBufferToImage(mpDevice, staging.getBuffer(), mpImage->getImage(), width, height, depth,
+                                   arrayLayers); // Pass arrayLayers
 
         if (mipmaps) {
-            generateMipmaps();
+            generateMipmaps(); // Note: generateMipmaps might also need an update for arrayLayers if used
         } else {
             Helpers::transitionImageLayout(mpDevice, mpImage->getImage(), format, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, mipLevels);
+                                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, mipLevels,
+                                           arrayLayers); // Pass arrayLayers
         }
     }
 
-    mpImage->createImageView(VK_IMAGE_ASPECT_COLOR_BIT);
+    // Create the image view with the correct viewType
+    mpImage->createImageView(VK_IMAGE_ASPECT_COLOR_BIT, viewType);
 
     mImageInfo = {
         .sampler = nullptr,

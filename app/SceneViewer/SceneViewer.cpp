@@ -14,6 +14,7 @@ public:
         int renderMode;
         int discardOnZeroAlpha;
         alignas(16) glm::vec3 lineColor;
+        float lod;
     };
 
     void loadScene()
@@ -138,6 +139,7 @@ public:
         PushConstants pushConstants = {
             .renderMode = mRenderMode,
             .discardOnZeroAlpha = mDiscardOnZeroAlpha,
+            .lod = 0.0, // TODO FIX Adjust
         };
         vkCmdPushConstants(cmd, mPipelines[PIPELINE_FILL]->getLayout(), VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                            sizeof pushConstants, &pushConstants);
@@ -156,6 +158,7 @@ public:
                 .renderMode = 10,
                 .discardOnZeroAlpha = mDiscardOnZeroAlpha,
                 .lineColor = mLineColor,
+                .lod = 0.0, // TODO FIX Adjust
             };
             vkCmdPushConstants(cmd, mPipelines[PIPELINE_LINE]->getLayout(), VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                                sizeof pushConstants, &pushConstants);

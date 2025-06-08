@@ -252,49 +252,69 @@ bool load_model_from_safetensors(const std::string& filename, SafetensorsModelDa
             parse_feature_grid_name_details(fgd); // Parse after getting name
             model_data.named_feature_grids[name] = fgd;
 
-            if (!fgd.base_feature_key.empty()) {
-                bool is_material_key = false;
-                for (const auto& mat_p : model_data.materials) { // Check if base_feature_key is an existing
-                                                                 // material ID
-                    if (mat_p.first == fgd.base_feature_key) {
-                        is_material_key = true;
-                        break;
-                    }
-                }
-                // A simpler heuristic: if the base_feature_key contains "shared" or
-                // doesn't match known material patterns. For now, let's assume if it's
-                // not explicitly a material, it might be shared. The most robust way is
-                // metadata from Python.
-                if (fgd.base_feature_key.find("shared") != std::string::npos ||
-                    !is_material_key) { // Simplified heuristic
+            if (name.find("_vq_indices_uint8") != std::string::npos) { // This is a VQ Index Grid
+                model_data.uses_vq = true;                             // Definitely using VQ if we find these
+
+                if (!fgd.base_feature_key.empty()) {
                     if (model_data.combined_feature_key_name.empty()) {
+                        // This is the first VQ index grid encountered, assume its base key is *the* shared key
                         model_data.combined_feature_key_name = fgd.base_feature_key;
-                        model_data.uses_combined_features = true;
+                        model_data.uses_combined_features =
+                            true; // If VQ grids are found, and they have a base_key, assume combined for now
+                        std::cout << "Info: Set combined_feature_key_name to '" << model_data.combined_feature_key_name
+                                  << "' based on VQ grid: " << name << std::endl;
                     } else if (model_data.combined_feature_key_name != fgd.base_feature_key) {
-                        // As before, this implies multiple shared keys, sticking to the
-                        // first.
+                        // We found another VQ index grid with a *different* base key.
+                        // This is unexpected if all VQ grids are truly shared under one key.
+                        std::cerr << "Warning: Multiple base_feature_keys ('" << model_data.combined_feature_key_name
+                                  << "' and '" << fgd.base_feature_key << "') found for VQ index grids. "
+                                  << "Sticking with the first one. This could indicate a model configuration issue."
+                                  << std::endl;
+                        // Keep uses_combined_features = true based on the first key.
                     }
+                    // If combined_feature_key_name matches fgd.base_feature_key, no action needed.
+                } else {
+                    std::cerr
+                        << "Warning: VQ index grid '" << name
+                        << "' has an empty base_feature_key after parsing. Cannot determine combined status properly."
+                        << std::endl;
                 }
+            } else if (name.rfind("packed_feature_grid_", 0) == 0) { // This is a Raw Packed Grid
+                // Logic for raw packed grids (if you use them) would go here.
+                // For now, it doesn't automatically set combined_feature_key_name unless specifically designed.
+                // If raw packed grids are also always combined under a specific key, add similar logic.
+                // If they can be per-material, then uses_combined_features might remain false.
+                // Current VQ-focused logic doesn't alter combined_feature_key_name for raw packed.
             }
+            // --- End of Corrected Logic for FeatureGrids ---
+
             if (fgd.level_idx != -1) {
                 model_data.max_level_idx = std::max(model_data.max_level_idx, fgd.level_idx);
             }
-        } else {
+        } else { // End of the 'else if' for feature grids
             std::cout << "Info: Unhandled tensor: " << name << std::endl;
         }
-    }
+    } // End of tensor loop
 
-    // Final check on combined_features based on what was found
-    if (model_data.combined_feature_key_name.empty() && !model_data.named_feature_grids.empty()) {
-        // If no combined_feature_key_name was set but grids exist, assume
-        // per-material
-        model_data.uses_combined_features = false;
-    } else if (!model_data.combined_feature_key_name.empty()) {
-        model_data.uses_combined_features = true;
+    // Final check for uses_combined_features is now simpler:
+    // If combined_feature_key_name was set (which happens if VQ grids were found and had a base key),
+    // then uses_combined_features should be true. Otherwise, it remains its default (false).
+    // The default is false, it only becomes true if a combined_feature_key_name is successfully set from a VQ grid.
+    // If uses_vq is true but combined_feature_key_name is STILL empty after the loop,
+    // it implies VQ grids were found but had no parsable base_feature_key, which is an error state.
+    if (model_data.uses_vq && model_data.combined_feature_key_name.empty() && !model_data.named_feature_grids.empty()) {
+        std::cerr
+            << "Error: VQ is active and VQ grids were loaded, but no combined_feature_key_name could be established. "
+            << "This indicates an issue with parsing VQ grid names or an unexpected model structure." << std::endl;
+        model_data.uses_combined_features = false; // Cannot assume combined without a key
     }
+    // Note: uses_combined_features is already true if combined_feature_key_name was set.
+    // If it's not set, it remains false.
+
+    print_model_data_summary(model_data);
 
     return true;
-}
+} // End of load_model_from_safetensors
 
 void print_model_data_summary(const SafetensorsModelData& data)
 {
