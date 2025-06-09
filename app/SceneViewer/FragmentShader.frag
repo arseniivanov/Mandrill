@@ -44,8 +44,13 @@ layout(set = 2, binding = 0) uniform MaterialParamsUBO {
     vec3 emission;
     uint hasTexture;
     uint isNeuralTexture;
+    float pad0;
+    float pad1;
+    float pad2;
+
     uint channelCounts[MAX_NEURAL_FEATURE_GRID_LEVELS][2];
-    uvec3 featureGridShapes[MAX_NEURAL_FEATURE_GRID_LEVELS][2];
+    float pad3;
+    uvec4 featureGridShapes[MAX_NEURAL_FEATURE_GRID_LEVELS][2];
 } materialParams;
 
 // Standard Textures (bindings 1-5)

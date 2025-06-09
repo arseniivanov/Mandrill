@@ -692,7 +692,7 @@ void Scene::compile()
 
                                     // Store the texture and the ORIGINAL shape for the shader
                                     mSharedVQIndexTextures[gridKey] = pGridTexture;
-                                    mSharedVQIndexOriginalShapes[gridKey] = glm::uvec3(channels, height, width);
+                                    mSharedVQIndexOriginalShapes[gridKey] = glm::uvec4(channels, height, width, 0.0);
 
                                     Log::Info("Created SHARED VQ Index Texture (key '{}'), L{}G{}, Original Shape: "
                                               "{}x{}x{}, Flattened to: {}x{}",
@@ -725,7 +725,7 @@ void Scene::compile()
                         if (mSharedVQIndexOriginalShapes.count(key)) {
                             mat.params.featureGridShapes[l][g] = mSharedVQIndexOriginalShapes[key];
                         } else {
-                            mat.params.featureGridShapes[l][g] = glm::uvec3(0, 0, 0); // Default to zero if not found
+                            mat.params.featureGridShapes[l][g] = glm::uvec4(0, 0, 0, 0); // Default to zero if not found
                         }
                     }
                 }

@@ -528,7 +528,7 @@ namespace Mandrill
         ptr<Buffer> mpVQCodebookBuffer;                                     // For "vq_codebook_patches_packed_uint8"
         std::map<std::pair<int, int>, ptr<Texture>> mSharedVQIndexTextures; // Key: {level_idx, grid_type}
         std::map<std::pair<int, int>, glm::ivec2> mSharedVQIndexShapes;     // Key: {level_idx, grid_type}
-        std::unordered_map<std::pair<int, int>, glm::uvec3, pair_hash> mSharedVQIndexOriginalShapes;
+        std::unordered_map<std::pair<int, int>, glm::uvec4, pair_hash> mSharedVQIndexOriginalShapes;
         ptr<Buffer> mpDummyStorageBuffer;
 
         // NTC additions end
