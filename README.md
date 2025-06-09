@@ -48,7 +48,8 @@ To build and compile the project use:
 
 To run the project, run the executable file:
 
-	./bin/SampleApp.bin
+	cd bin
+	./SampleApp.bin
 
 ## Setting up a new project with Mandrill as submodule
 
@@ -146,6 +147,11 @@ The scene viewer uses the `Scene.cpp` scene abstraction that allows for loading 
 To upload the scene from host (CPU) to device (GPU), the scene has to be compiled and synced to device.
 See the `loadScene()` function and the `Scene.h` documentation for proper use.
 The scene has a predetermined set of descritors that are used for rendering materials and so on.
+
+### SDF
+
+This application implements a basic signed distance field (SDF) renderer.
+Rendering is done using a fullscreen triangle pair, and the SDF is sampled in the fragment shader.
 
 ### RayTracer
 

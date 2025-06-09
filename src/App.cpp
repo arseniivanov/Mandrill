@@ -46,9 +46,11 @@ void App::run()
 {
     Log::Info("Running...");
 
+    float prevTimeStamp = 0.0f;
     while (!glfwWindowShouldClose(mpWindow)) {
-        mDelta = static_cast<float>(glfwGetTime());
-        glfwSetTime(0.0);
+        mTime = static_cast<float>(glfwGetTime());
+        mDelta = mTime - prevTimeStamp;
+        prevTimeStamp = mTime;
 
         mDeltaSmooth = kSmoothingFactor * mDelta + (1 - kSmoothingFactor) * mDeltaSmooth;
 
@@ -391,7 +393,7 @@ void App::baseCursorPosCallback(GLFWwindow* pWindow, double xPos, double yPos)
 
 void App::baseMouseButtonCallback(GLFWwindow* pWindow, int button, int action, int mods, ptr<Camera> pCamera)
 {
-    if (button == GLFW_MOUSE_BUTTON_2 && action == GLFW_PRESS) {
+    if (button == GLFW_MOUSE_BUTTON_2 && action == GLFW_PRESS && pCamera) {
         bool captured = pCamera->toggleMouseCapture();
         glfwSetInputMode(pWindow, GLFW_CURSOR, captured ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL);
 
