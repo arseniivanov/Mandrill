@@ -47,13 +47,20 @@ Buffer::Buffer(ptr<Device> pDevice, VkDeviceSize size, VkBufferUsageFlags usage,
 
 Buffer::~Buffer()
 {
-    vkDeviceWaitIdle(mpDevice->getDevice());
+    // vkDeviceWaitIdle(mpDevice->getDevice()); // REMOVE THIS LINE
 
     if (mpHostMap) {
         vkUnmapMemory(mpDevice->getDevice(), mMemory);
         mpHostMap = nullptr;
     }
 
+    // You might also need to ensure the device is idle before destroying the buffer
+    // if it's being used by in-flight commands. A better pattern is to use
+    // fences or a deferred destruction queue, but for now, let's see if removing
+    // the idle call from this hot path fixes the allocation issue.
+    // If you get validation errors about destroying a buffer in use, a single
+    // vkDeviceWaitIdle at the end of the entire Scene::compile() is better.
+    // Let's assume for now that Helpers::cmdEnd handles synchronization sufficiently.
     vkDestroyBuffer(mpDevice->getDevice(), mBuffer, nullptr);
     vkFreeMemory(mpDevice->getDevice(), mMemory, nullptr);
 }

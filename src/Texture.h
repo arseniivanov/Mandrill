@@ -16,6 +16,7 @@ namespace Mandrill
             Texture2D,
             Texture3D,
             CubeMap,
+            Texture2DArray,
         };
 
         MANDRILL_NON_COPYABLE(Texture)
@@ -108,8 +109,12 @@ namespace Mandrill
         }
 
     private:
-        void create(VkFormat format, const void* pData, uint32_t width, uint32_t height, uint32_t depth,
+        void create(Type type, VkFormat format, const void* pData, uint32_t width, uint32_t height, uint32_t depth,
                     uint32_t bytesPerPixel, bool mipmaps);
+
+        void create_array(VkFormat format, const void* pData, uint32_t width, uint32_t height, uint32_t layerCount,
+                          uint32_t bytesPerPixel, bool mipmaps);
+
         void generateMipmaps();
 
         ptr<Device> mpDevice;

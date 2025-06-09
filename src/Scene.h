@@ -13,6 +13,17 @@
 
 #include "model_loader.h"
 #define MAX_NEURAL_FEATURE_GRID_LEVELS 4
+#define MAX_MLP_LAYERS 3
+
+
+struct pair_hash {
+    template <class T1, class T2> std::size_t operator()(const std::pair<T1, T2>& p) const
+    {
+        auto h1 = std::hash<T1>{}(p.first);
+        auto h2 = std::hash<T2>{}(p.second);
+        return h1 ^ (h2 << 1);
+    }
+};
 
 namespace Mandrill
 {
@@ -50,6 +61,8 @@ namespace Mandrill
         glm::vec3 emission;
         uint32_t hasTexture;
         uint32_t isNeuralTexture;
+        uint32_t channelCounts[MAX_NEURAL_FEATURE_GRID_LEVELS][2];
+        glm::uvec3 featureGridShapes[MAX_NEURAL_FEATURE_GRID_LEVELS][2];
     };
 
     struct alignas(16) MaterialDevice {
@@ -78,6 +91,12 @@ namespace Mandrill
         std::string name;
         bool isNeuralTexture = false;
         const MaterialSpecificData* pCpuNeuralMaterialData = nullptr;
+        // Key: {level_idx, grid_type (0 or 1)}
+        std::map<std::pair<int, int>, ptr<Buffer>> neuralChannelSelectionBuffers;
+
+        // MLP layer buffers
+        std::vector<ptr<Buffer>> mlpWeightBuffers;
+        std::vector<ptr<Buffer>> mlpBiasBuffers;
 
         std::map<std::pair<int, int>, ptr<Texture>> neuralVQGrids;
         std::map<std::pair<int, int>, glm::ivec2> neuralVQGridShapes;
@@ -496,10 +515,11 @@ namespace Mandrill
         ptr<Sampler> m_pLastSetSamplerInScene;
 
         ptr<Buffer> mpPaletteBuffer;
-        // ptr<Buffer> mpVQCodebookBuffer; // Add later
-        // ptr<Buffer> mpMLPAllWeightsBuffer; // Add later
-        // ptr<Buffer> mpMLPAllBiasesBuffer;  // Add later
-        // ptr<Buffer> mpCSAllBuffer;         // Add later
+        ptr<Buffer> mpVQCodebookBuffer;                                     // For "vq_codebook_patches_packed_uint8"
+        std::map<std::pair<int, int>, ptr<Texture>> mSharedVQIndexTextures; // Key: {level_idx, grid_type}
+        std::map<std::pair<int, int>, glm::ivec2> mSharedVQIndexShapes;     // Key: {level_idx, grid_type}
+        std::unordered_map<std::pair<int, int>, glm::uvec3, pair_hash> mSharedVQIndexOriginalShapes;
+        ptr<Buffer> mpDummyStorageBuffer;
 
         // NTC additions end
         void addTexture(std::string texturePath);

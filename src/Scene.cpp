@@ -6,6 +6,7 @@
 #include "Pipeline.h"
 
 #include "tiny_obj_loader.h"
+#include <complex>
 
 using namespace Mandrill;
 
@@ -193,6 +194,123 @@ namespace std
     };
 } // namespace std
 
+
+std::string toLower(std::string s)
+{
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::tolower(c); });
+    return s;
+}
+
+// The deriveBaseNameFromTexture function - this is the core new logic
+// It takes a texture filename (just the name, not the full path) and returns the derived base.
+std::string deriveBaseNameFromTextureFilename(const std::string& textureFilename)
+{
+    if (textureFilename.empty()) {
+        return ""; // Or handle as an error/warning
+    }
+
+    std::filesystem::path p(textureFilename);
+    std::string stem_original = p.stem().string(); // e.g., "sponza_bricks_a_diff" from "sponza_bricks_a_diff.png"
+    std::string stem_lower = toLower(stem_original);
+
+    std::vector<std::string> keywords_to_remove_sorted = {
+        "displacement", "displace_inv", "displace", "combined_orm", "normal",    "nor_gl",   "roughness",
+        "rough",        "occlusion",    "ambient",  "metallic",     "metalness", "specular", "spec",
+        "emissive",     "diffuse",      "albedo",   "color",        "diff",      "mask",     "disp",
+        "bump",         "emi",          "emt",      "mra",          "ao",
+    };
+    // Sort by length descending
+    std::sort(keywords_to_remove_sorted.rbegin(), keywords_to_remove_sorted.rend(),
+              [](const std::string& a, const std::string& b) { return a.length() < b.length(); });
+
+    std::string current_stem_to_process = stem_original;
+    std::string current_stem_lower_to_process = stem_lower;
+
+    for (const auto& keyword : keywords_to_remove_sorted) {
+        std::string keyword_l = toLower(keyword); // keyword is already lower from list
+        size_t pos = current_stem_lower_to_process.rfind(keyword_l);
+
+        if (pos != std::string::npos) {
+            // Check if it's a "whole word" suffix or delimited part
+            bool is_actual_suffix = (pos + keyword_l.length() == current_stem_lower_to_process.length());
+            bool preceded_by_delimiter = (pos > 0 && (current_stem_lower_to_process[pos - 1] == '_' ||
+                                                      current_stem_lower_to_process[pos - 1] == '.' ||
+                                                      current_stem_lower_to_process[pos - 1] == '-'));
+
+            if (is_actual_suffix || preceded_by_delimiter) {
+                std::string new_candidate_stem;
+                if (pos > 0 && preceded_by_delimiter) { // "base_keyword" -> "base"
+                    new_candidate_stem = current_stem_to_process.substr(0, pos - 1);
+                } else if (pos > 0 && is_actual_suffix) { // "basekeyword" -> "base"
+                    new_candidate_stem = current_stem_to_process.substr(0, pos);
+                } else if (pos == 0 && is_actual_suffix &&
+                           keyword_l.length() < current_stem_lower_to_process.length()) { // "keyword_base" -> "base"
+                    new_candidate_stem = current_stem_to_process.substr(keyword_l.length());
+                    // trim leading delimiter if any
+                    if (!new_candidate_stem.empty() &&
+                        (new_candidate_stem.front() == '_' || new_candidate_stem.front() == '.' ||
+                         new_candidate_stem.front() == '-')) {
+                        new_candidate_stem = new_candidate_stem.substr(1);
+                    }
+                } else if (pos == 0 && is_actual_suffix &&
+                           keyword_l.length() ==
+                               current_stem_lower_to_process.length()) { // "keyword" -> "" (then handled)
+                    new_candidate_stem = "";
+                } else {
+                    continue; // Not a clean strip, try next keyword
+                }
+
+
+                // Trim trailing delimiters from the new candidate
+                while (!new_candidate_stem.empty() &&
+                       (new_candidate_stem.back() == '_' || new_candidate_stem.back() == '.' ||
+                        new_candidate_stem.back() == '-')) {
+                    new_candidate_stem.pop_back();
+                }
+
+                if (!new_candidate_stem.empty()) {
+                    // If something was stripped and result is not empty, update and continue trying to strip more from
+                    // the result current_stem_to_process = new_candidate_stem; current_stem_lower_to_process =
+                    // toLower(current_stem_to_process); Log::Debug("Stripped '{}', intermediate base name: '{}'",
+                    // keyword, current_stem_to_process); continue; // Found and stripped one, try stripping more from
+                    // this result (optional)
+
+                    // OR: Assume one primary keyword suffix is enough (simpler)
+                    // Fix for mtl.file windows dash being a part of the stem
+                    auto pos = new_candidate_stem.find_last_of('\\');
+                    if (pos != std::string::npos) {
+                        auto real_stem = new_candidate_stem.substr(0, pos);
+                        new_candidate_stem = new_candidate_stem.substr(pos + 1);
+                    }
+                    Log::Debug("Derived base name for texture file '{}' by stripping '{}': result '{}'",
+                               textureFilename, keyword, new_candidate_stem);
+
+                    return new_candidate_stem;
+
+                } else if (stem_original == keyword_l) { // Original stem was just the keyword
+                    Log::Info("Texture file '{}' stem is just the keyword '{}'. Using original stem '{}' as base name.",
+                              textureFilename, keyword, stem_original);
+                    return stem_original; // Safetensor key is likely "diffuse" itself if filename was "diffuse.png"
+                }
+            }
+        }
+    }
+
+    // If no keywords were stripped, or stripping resulted in empty and original wasn't just a keyword
+    if (current_stem_to_process == stem_original) {
+        auto pos = current_stem_to_process.find_last_of('\\');
+        if (pos != std::string::npos) {
+            auto real_stem = current_stem_to_process.substr(0, pos);
+            current_stem_to_process = current_stem_to_process.substr(pos + 1);
+        }
+
+        Log::Info("No keywords stripped from texture file '{}' (stem: '{}'). Using original stem as base name.",
+                  textureFilename, current_stem_to_process);
+    }
+
+    return current_stem_to_process; // Return whatever is left (could be original stem)
+}
+
 std::vector<uint32_t> Scene::addMeshFromFile(const std::filesystem::path& path,
                                              const std::filesystem::path& materialPath)
 {
@@ -333,8 +451,23 @@ std::vector<uint32_t> Scene::addMeshFromFile(const std::filesystem::path& path,
     // Load materials
     for (auto& material : materials) {
         Material mat;
-        mat.name = material.name;
         mat.params.isNeuralTexture = 0;
+
+        std::string name_for_linking = material.name; // Default to original MTL name
+        if (!material.diffuse_texname.empty()) {
+            std::string derived = deriveBaseNameFromTextureFilename(material.diffuse_texname);
+            if (!derived.empty()) {
+                name_for_linking = derived;
+            }
+        } else if (!material.specular_texname.empty()) { // Fallback
+            std::string derived = deriveBaseNameFromTextureFilename(material.specular_texname);
+            if (!derived.empty()) {
+                name_for_linking = derived;
+            }
+        }
+        mat.name = name_for_linking;
+        Log::Info("Material (original MTL: '{}', diffuse_tex: '{}') processed for linking as: '{}'", material.name,
+                  material.diffuse_texname, mat.name);
 
         mat.params.diffuse.r = material.diffuse[0];
         mat.params.diffuse.g = material.diffuse[1];
@@ -391,7 +524,6 @@ std::vector<uint32_t> Scene::addMeshFromFile(const std::filesystem::path& path,
         }
 
         mMaterials.push_back(mat);
-        mMaterials.back().name = material.name;
     }
 
     // Add to statistics
@@ -401,6 +533,71 @@ std::vector<uint32_t> Scene::addMeshFromFile(const std::filesystem::path& path,
     }
 
     return newMeshIndices;
+}
+
+void executeSingleTimeCommands(Mandrill::ptr<Mandrill::Device> device, std::function<void(VkCommandBuffer)> functor)
+{
+    if (!device) {
+        Mandrill::Log::Error("executeSingleTimeCommands: Device pointer is null.");
+        return;
+    }
+    VkDevice vkDevice = device->getDevice(); // Corrected: Renamed from mDevice to vkDevice for clarity
+    VkCommandPool commandPool = device->getCommandPool();
+    VkQueue queue = device->getQueue();
+
+    if (vkDevice == VK_NULL_HANDLE || commandPool == VK_NULL_HANDLE || queue == VK_NULL_HANDLE) {
+        Mandrill::Log::Error("executeSingleTimeCommands: Vulkan device, command pool, or queue is null.");
+        return;
+    }
+
+    VkCommandBufferAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    allocInfo.commandPool = commandPool;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandBufferCount = 1;
+
+    VkCommandBuffer commandBuffer;
+    if (vkAllocateCommandBuffers(vkDevice, &allocInfo, &commandBuffer) != VK_SUCCESS) {
+        Mandrill::Log::Error("Failed to allocate single-time command buffer!");
+        return;
+    }
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+    if (vkBeginCommandBuffer(commandBuffer, &beginInfo) != VK_SUCCESS) {
+        Mandrill::Log::Error("Failed to begin single-time command buffer!");
+        vkFreeCommandBuffers(vkDevice, commandPool, 1, &commandBuffer);
+        return;
+    }
+
+    functor(commandBuffer);
+
+    if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS) {
+        Mandrill::Log::Error("Failed to end single-time command buffer!");
+        vkFreeCommandBuffers(vkDevice, commandPool, 1, &commandBuffer);
+        return;
+    }
+
+    VkSubmitInfo submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &commandBuffer;
+
+    VkResult submitResult = vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
+    if (submitResult != VK_SUCCESS) {
+        Mandrill::Log::Error("Failed to submit single-time command buffer! Error: {}", static_cast<int>(submitResult));
+        vkFreeCommandBuffers(vkDevice, commandPool, 1, &commandBuffer);
+        return;
+    }
+
+    VkResult waitResult = vkQueueWaitIdle(queue);
+    if (waitResult != VK_SUCCESS) {
+        Mandrill::Log::Error("Failed to wait for queue idle! Error: {}", static_cast<int>(waitResult));
+    }
+
+    vkFreeCommandBuffers(vkDevice, commandPool, 1, &commandBuffer);
 }
 
 void Scene::compile()
@@ -507,92 +704,275 @@ void Scene::compile()
     }
 
     if (mHasNeuralModel) {
-        // 1. Palette Buffer
+        Log::Info("Compiling scene with Neural Model data...");
+
+        // Palette Buffer
         if (!mNeuralModelData.palette.values.empty()) {
             VkDeviceSize paletteBufferSize = sizeof(float) * mNeuralModelData.palette.values.size();
             if (paletteBufferSize > 0) {
                 mpPaletteBuffer =
                     make_ptr<Buffer>(mpDevice, paletteBufferSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT); // Or DEVICE_LOCAL + staging
+                                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
                 mpPaletteBuffer->copyFromHost(mNeuralModelData.palette.values.data(), paletteBufferSize, 0);
                 Log::Info("Uploaded palette buffer to GPU: {} floats", mNeuralModelData.palette.values.size());
             }
+        } else {
+            Log::Warning("Neural model data: Palette values are empty.");
         }
 
-        // VQ Codebook, MLP Weights, etc., would be created here similarly later.
-
-        // Create VQ Grid Textures for relevant materials
-        for (auto& mat : mMaterials) {
-            if (mat.isNeuralTexture &&
-                mat.pCpuNeuralMaterialData) { // mat.isNeuralTexture already set by loadNeuralModel
-                                              // Check if the model globally uses VQ AND this material has VQ grids.
-                                              // The current SafetensorsModelData structure implies uses_vq is global.
-                // Feature grids are named like "materialID_level_X_grid_Y_vq_indices_uint8"
-                bool material_uses_vq_grids = false; // Determine this based on grid names for this material
-
-                for (const auto& fg_pair : mNeuralModelData.named_feature_grids) {
-                    const auto& fgd = fg_pair.second;
-                    if (fgd.base_feature_key == mat.name && fgd.name.find("_vq_indices_uint8") != std::string::npos) {
-                        material_uses_vq_grids = true;
-                        break;
-                    }
+        // VQ Codebook Buffer
+        if (mNeuralModelData.uses_vq) {
+            if (!mNeuralModelData.vq_codebook.packed_data.empty()) {
+                VkDeviceSize codebookBufferSize = sizeof(uint8_t) * mNeuralModelData.vq_codebook.packed_data.size();
+                if (codebookBufferSize > 0) {
+                    mpVQCodebookBuffer =
+                        make_ptr<Buffer>(mpDevice, codebookBufferSize,
+                                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                    ptr<Buffer> pStagingBuffer =
+                        make_ptr<Buffer>(mpDevice, codebookBufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                    pStagingBuffer->copyFromHost(mNeuralModelData.vq_codebook.packed_data.data(), codebookBufferSize,
+                                                 0);
+                    executeSingleTimeCommands(mpDevice, [&](VkCommandBuffer cmd) {
+                        VkBufferCopy copyRegion{};
+                        copyRegion.size = codebookBufferSize;
+                        vkCmdCopyBuffer(cmd, pStagingBuffer->getBuffer(), mpVQCodebookBuffer->getBuffer(), 1,
+                                        &copyRegion); // Corrected to getBuffer()
+                    });
+                    Log::Info("Uploaded VQ Codebook buffer to GPU: {} bytes", codebookBufferSize);
                 }
+            } else {
+                Log::Warning("Neural model data: VQ enabled, but VQ Codebook packed_data is empty.");
+            }
+        }
 
-                if (material_uses_vq_grids) { // Only create VQ grids if this material actually uses them
-                    for (const auto& fg_pair : mNeuralModelData.named_feature_grids) {
-                        const auto& fgd = fg_pair.second;
-                        if (fgd.base_feature_key == mat.name &&
-                            fgd.name.find("_vq_indices_uint8") != std::string::npos) {
-                            if (fgd.level_idx >= 0 && fgd.level_idx < MAX_NEURAL_FEATURE_GRID_LEVELS &&
-                                fgd.grid_type >= 0 && fgd.grid_type < 2) { // grid_type 0 or 1
+        // SHARED VQ Index Grid Textures
+        if (mNeuralModelData.uses_vq && mNeuralModelData.uses_combined_features) {
+            const std::string& sharedGridsBaseKey = mNeuralModelData.combined_feature_key_name;
+            Log::Info("Attempting to create shared VQ grids. Uses VQ: {}, Uses Combined: {}, SharedKey: '{}'",
+                      mNeuralModelData.uses_vq, mNeuralModelData.uses_combined_features,
+                      sharedGridsBaseKey); // ADD THIS
+            if (sharedGridsBaseKey.empty()) {
+                Log::Info("Neural model data: Combined VQ enabled, but combined_feature_key_name is empty.");
+            } else {
+                Log::Info("Creating shared VQ Index Textures using base key: '{}'", sharedGridsBaseKey);
+                for (const auto& fg_pair : mNeuralModelData.named_feature_grids) {
+                    const FeatureGridData& fgd = fg_pair.second;
+                    if (fgd.base_feature_key == sharedGridsBaseKey &&
+                        fgd.name.find("_vq_indices_uint8") != std::string::npos) { // Ensure it's a VQ index grid
+                        std::pair<int, int> gridKey = {fgd.level_idx, fgd.grid_type};
+                        if (fgd.level_idx != -1 && fgd.grid_type != -1 &&
+                            mSharedVQIndexTextures.find(gridKey) == mSharedVQIndexTextures.end()) {
+                            if (fgd.shape.size() == 3) {
+                                uint32_t channels = static_cast<uint32_t>(fgd.shape[0]);
+                                uint32_t height = static_cast<uint32_t>(fgd.shape[1]);
+                                uint32_t width = static_cast<uint32_t>(fgd.shape[2]);
 
-                                if (fgd.shape.size() >= 2) { // Expecting [height, width] at least
-                                    uint32_t width =
-                                        static_cast<uint32_t>(fgd.shape[1]); // Assuming shape[0]=height, shape[1]=width
-                                    uint32_t height = static_cast<uint32_t>(fgd.shape[0]);
+                                // Create a single TALL texture by stacking channels vertically
+                                uint32_t total_height = height * channels;
+                                size_t expected_size = static_cast<size_t>(width) * total_height;
 
-                                    if (width > 0 && height > 0 && !fgd.data_uint8.empty() &&
-                                        fgd.data_uint8.size() == width * height) {
-                                        // Texture constructor: device, type, format, data, width, height, depth,
-                                        // bytes_per_pixel, generate_mips
-                                        ptr<Texture> pGridTexture =
-                                            make_ptr<Texture>(mpDevice, Texture::Type::Texture2D, VK_FORMAT_R8_UINT,
-                                                              fgd.data_uint8.data(), width, height, 1, 1, false);
+                                if (width > 0 && height > 0 && channels > 0 && !fgd.data_uint8.empty() &&
+                                    fgd.data_uint8.size() == expected_size) {
 
-                                        if (m_pLastSetSamplerInScene) {
-                                            pGridTexture->setSampler(m_pLastSetSamplerInScene);
-                                        } else {
-                                            Log::Error(
-                                                "Critical: m_pLastSetSamplerInScene is null in Scene::compile(). "
-                                                "Neural grid textures will not have a sampler. Ensure "
-                                                "Scene::setSampler was called.");
-                                        }
+                                    // Create the flattened 2D texture
+                                    ptr<Texture> pGridTexture =
+                                        make_ptr<Texture>(mpDevice, Texture::Type::Texture2DArray, VK_FORMAT_R8_UINT,
+                                                          fgd.data_uint8.data(), width, height, channels, 1, false);
 
-                                        mat.neuralVQGrids[{fgd.level_idx, fgd.grid_type}] = pGridTexture;
-                                        mat.neuralVQGridShapes[{fgd.level_idx, fgd.grid_type}] =
-                                            glm::ivec2(width, height);
-                                        Log::Info("Created VQ grid texture for material '{}', L{}G{}, {}x{}", mat.name,
-                                                  fgd.level_idx, fgd.grid_type, width, height);
+                                    if (m_pLastSetSamplerInScene) {
+                                        pGridTexture->setSampler(m_pLastSetSamplerInScene);
                                     } else {
-                                        Log::Warning("VQ grid for material '{}', L{}G{} has invalid dims ({}x{}) or "
-                                                     "data size ({}). Skipping.",
-                                                     mat.name, fgd.level_idx, fgd.grid_type, width, height,
-                                                     fgd.data_uint8.size());
+                                        Log::Error("Critical: m_pLastSetSamplerInScene is null for VQ index textures.");
                                     }
+
+                                    // Store the texture and the ORIGINAL shape for the shader
+                                    mSharedVQIndexTextures[gridKey] = pGridTexture;
+                                    mSharedVQIndexOriginalShapes[gridKey] = glm::uvec3(channels, height, width);
+
+                                    Log::Info("Created SHARED VQ Index Texture (key '{}'), L{}G{}, Original Shape: "
+                                              "{}x{}x{}, Flattened to: {}x{}",
+                                              sharedGridsBaseKey, fgd.level_idx, fgd.grid_type, channels, height, width,
+                                              width, total_height);
                                 } else {
-                                    Log::Warning("VQ grid for material '{}', L{}G{} has insufficient shape dimensions "
-                                                 "({}). Skipping.",
-                                                 mat.name, fgd.level_idx, fgd.grid_type, fgd.shape.size());
+                                    Log::Warning("SHARED VQ Index Grid L{}G{} (key '{}') invalid dims/data. Name: {}. "
+                                                 "Skipping. Got shape [{}, {}, {}], expected size {}, got {}",
+                                                 fgd.level_idx, fgd.grid_type, sharedGridsBaseKey, fgd.name, channels,
+                                                 height, width, expected_size, fgd.data_uint8.size());
                                 }
+                            } else {
+                                Log::Warning("SHARED VQ Index Grid L{}G{} (key '{}') does not have 3 dimensions. Shape "
+                                             "size: {}. Skipping.",
+                                             fgd.level_idx, fgd.grid_type, sharedGridsBaseKey, fgd.shape.size());
                             }
                         }
                     }
                 }
             }
         }
+
+        for (Material& mat : mMaterials) {
+            if (mat.isNeuralTexture) {
+                // For each level and grid, find the corresponding shared shape and assign it to the material's UBO
+                // struct
+                for (int l = 0; l < MAX_NEURAL_FEATURE_GRID_LEVELS; ++l) {
+                    for (int g = 0; g < 2; ++g) {
+                        auto key = std::make_pair(l, g);
+                        if (mSharedVQIndexOriginalShapes.count(key)) {
+                            mat.params.featureGridShapes[l][g] = mSharedVQIndexOriginalShapes[key];
+                        } else {
+                            mat.params.featureGridShapes[l][g] = glm::uvec3(0, 0, 0); // Default to zero if not found
+                        }
+                    }
+                }
+            }
+
+            Log::Info("Processing neural data for material: {}", mat.name);
+            const MaterialSpecificData& specific_mat_data = *mat.pCpuNeuralMaterialData;
+
+            // --- Channel Selection Data ---
+            for (int l = 0; l < MAX_NEURAL_FEATURE_GRID_LEVELS; ++l) {
+                auto it = specific_mat_data.level_channel_selections.find(l);
+                if (it != specific_mat_data.level_channel_selections.end()) {
+                    const ChannelSelections& selections = it->second;
+
+                    // Grid 0
+                    mat.params.channelCounts[l][0] = selections.grid0_selected_channels.size();
+                    if (!selections.grid0_selected_channels.empty()) {
+                        VkDeviceSize bufferSize = sizeof(uint16_t) * selections.grid0_selected_channels.size();
+                        ptr<Buffer> pGpuBuffer = make_ptr<Buffer>(
+                            mpDevice, bufferSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                        ptr<Buffer> pStaging = make_ptr<Buffer>(mpDevice, bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                        pStaging->copyFromHost(selections.grid0_selected_channels.data(), bufferSize);
+                        executeSingleTimeCommands(mpDevice, [&](VkCommandBuffer cmd) {
+                            VkBufferCopy cr{};
+                            cr.size = bufferSize;
+                            vkCmdCopyBuffer(cmd, pStaging->getBuffer(), pGpuBuffer->getBuffer(), 1, &cr);
+                        });
+                        mat.neuralChannelSelectionBuffers[{l, 0}] = pGpuBuffer;
+                        Log::Debug("Uploaded channel selection for '{}' L{}G0: {} indices", mat.name, l,
+                                   selections.grid0_selected_channels.size());
+                    }
+
+                    // Grid 1
+                    mat.params.channelCounts[l][1] = selections.grid1_selected_channels.size();
+                    if (!selections.grid1_selected_channels.empty()) {
+                        VkDeviceSize bufferSize = sizeof(uint16_t) * selections.grid1_selected_channels.size();
+                        ptr<Buffer> pGpuBuffer = make_ptr<Buffer>(
+                            mpDevice, bufferSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                        ptr<Buffer> pStaging = make_ptr<Buffer>(mpDevice, bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                        pStaging->copyFromHost(selections.grid1_selected_channels.data(), bufferSize);
+                        executeSingleTimeCommands(mpDevice, [&](VkCommandBuffer cmd) {
+                            VkBufferCopy cr{};
+                            cr.size = bufferSize;
+                            vkCmdCopyBuffer(cmd, pStaging->getBuffer(), pGpuBuffer->getBuffer(), 1, &cr);
+                        });
+                        mat.neuralChannelSelectionBuffers[{l, 1}] = pGpuBuffer;
+                        Log::Debug("Uploaded channel selection for '{}' L{}G1: {} indices", mat.name, l,
+                                   selections.grid1_selected_channels.size());
+                    }
+                } else {
+                    // No selections for this level
+                    mat.params.channelCounts[l][0] = 0;
+                    mat.params.channelCounts[l][1] = 0;
+                }
+            }
+
+            // --- MLP Layer Data ---
+            if (specific_mat_data.mlp_layers.size() > MAX_MLP_LAYERS) {
+                Log::Warning("Material '{}' has {} MLP layers, but layout only supports {}. Truncating.", mat.name,
+                             specific_mat_data.mlp_layers.size(), MAX_MLP_LAYERS);
+            }
+            for (const MLPLayer& sm_layer : specific_mat_data.mlp_layers) {
+                if (mat.mlpWeightBuffers.size() >= MAX_MLP_LAYERS)
+                    break; // Adhere to layout limit
+
+                // Weights
+                if (!sm_layer.weights_raw_bytes.empty()) {
+                    VkDeviceSize bufferSize = sm_layer.weights_raw_bytes.size();
+                    ptr<Buffer> pGpuBuffer = make_ptr<Buffer>(
+                        mpDevice, bufferSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                    ptr<Buffer> pStaging =
+                        make_ptr<Buffer>(mpDevice, bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                    pStaging->copyFromHost(sm_layer.weights_raw_bytes.data(), bufferSize);
+                    executeSingleTimeCommands(mpDevice, [&](VkCommandBuffer cmd) {
+                        VkBufferCopy cr{};
+                        cr.size = bufferSize;
+                        vkCmdCopyBuffer(cmd, pStaging->getBuffer(), pGpuBuffer->getBuffer(), 1, &cr);
+                    });
+                    mat.mlpWeightBuffers.push_back(pGpuBuffer);
+                    Log::Debug("Uploaded MLP L{} weights for '{}', {} bytes", sm_layer.layer_idx, mat.name, bufferSize);
+                } else {
+                    mat.mlpWeightBuffers.push_back(nullptr); // Push null to keep indices aligned
+                }
+
+                // Bias
+                if (!sm_layer.bias_raw_bytes.empty()) {
+                    VkDeviceSize bufferSize = sm_layer.bias_raw_bytes.size();
+                    ptr<Buffer> pGpuBuffer = make_ptr<Buffer>(
+                        mpDevice, bufferSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                    ptr<Buffer> pStaging =
+                        make_ptr<Buffer>(mpDevice, bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                    pStaging->copyFromHost(sm_layer.bias_raw_bytes.data(), bufferSize);
+                    executeSingleTimeCommands(mpDevice, [&](VkCommandBuffer cmd) {
+                        VkBufferCopy cr{};
+                        cr.size = bufferSize;
+                        vkCmdCopyBuffer(cmd, pStaging->getBuffer(), pGpuBuffer->getBuffer(), 1, &cr);
+                    });
+                    mat.mlpBiasBuffers.push_back(pGpuBuffer);
+                    Log::Debug("Uploaded MLP L{} bias for '{}', {} bytes", sm_layer.layer_idx, mat.name, bufferSize);
+                } else {
+                    mat.mlpBiasBuffers.push_back(nullptr); // Push null to keep indices aligned
+                }
+            }
+        }
+        Log::Info("Finished processing Neural Model data.");
+    } else {
+        Log::Info("No Neural Model data to process for scene compilation.");
     }
 
+    // --- Original Mandrill Scene::compile() logic STARTS here ---
+    // (This part was previously missing or misplaced)
+    mVertexCount = 0;
+    mIndexCount = 0;
+    for (const auto& mesh : mMeshes) {
+        mVertexCount += count(mesh.vertices);
+        mIndexCount += count(mesh.indices);
+    }
+
+    Log::Info("Compiling scene with {} meshes, {} vertices and {} indices", count(mMeshes), mVertexCount, mIndexCount);
+
+    if (mVertexCount > 0) {
+        mpVertexBuffer = make_ptr<Buffer>(mpDevice, sizeof(Vertex) * mVertexCount,
+                                          VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                              VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                                              VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
+                                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    }
+    if (mIndexCount > 0) {
+        mpIndexBuffer = make_ptr<Buffer>(mpDevice, sizeof(uint32_t) * mIndexCount,
+                                         VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                             VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                                             VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
+                                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    }
+    mpTransforms = make_ptr<Buffer>(mpDevice, sizeof(glm::mat4) * count(mNodes) * mpSwapchain->getImages().size(),
+                                    VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    mpMaterialParams =
+        make_ptr<Buffer>(mpDevice, sizeof(MaterialParams) * count(mMaterials), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
     // Associate each material with a part of the material params buffer
     MaterialParams* materialParams_ptr = static_cast<MaterialParams*>(mpMaterialParams->getHostMap());
@@ -608,16 +988,26 @@ void Scene::compile()
         mMaterials[i].paramsOffset = Helpers::alignTo(i * sizeof(MaterialParams), alignment);
     }
 
-    // ... (rest of the existing compile function, like ray tracing buffers) ...
+    if (!mpDummyStorageBuffer) {
+        const uint32_t dummyData = 0;
+        ptr<Buffer> pStagingBuffer =
+            make_ptr<Buffer>(mpDevice, sizeof(dummyData), VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        pStagingBuffer->copyFromHost(&dummyData, sizeof(dummyData));
 
-    if (!mSupportRayTracing) { // Or always, if descriptors are needed before/without AS build
-        createDescriptors();
+        mpDummyStorageBuffer = make_ptr<Buffer>(mpDevice, sizeof(dummyData),
+                                                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+        executeSingleTimeCommands(mpDevice, [&](VkCommandBuffer cmd) {
+            VkBufferCopy copyRegion{};
+            copyRegion.size = sizeof(dummyData);
+            vkCmdCopyBuffer(cmd, pStagingBuffer->getBuffer(), mpDummyStorageBuffer->getBuffer(), 1, &copyRegion);
+        });
+        Log::Info("Created dummy storage buffer for unused descriptor slots.");
     }
 
-
-    if (!mSupportRayTracing) {
-        createDescriptors();
-    }
+    createDescriptors();
 }
 
 void Scene::syncToDevice()
@@ -730,19 +1120,33 @@ ptr<Layout> Scene::getLayout()
     desc.emplace_back(2, 4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_ALL_GRAPHICS);
     desc.emplace_back(2, 5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_ALL_GRAPHICS);
 
-    // Bindings for Neural VQ Grids (usampler2D in shader) - up to MAX_LEVELS * 2 grids
-    // Example: L0G0, L0G1, L1G0, L1G1, ...
     uint32_t currentBinding = 6;
-    for (int level = 0; level < MAX_NEURAL_FEATURE_GRID_LEVELS; ++level) {
-        for (int grid_type = 0; grid_type < 2; ++grid_type) {
-            desc.emplace_back(2, currentBinding++, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                              VK_SHADER_STAGE_FRAGMENT_BIT);
-        }
+    // 2.6 - 2.13: Neural VQ Grids (usampler2D)
+    for (int i = 0; i < MAX_NEURAL_FEATURE_GRID_LEVELS * 2; ++i) {
+        desc.emplace_back(2, currentBinding++, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT);
     }
 
+    // 2.14 - 2.21: Neural Channel Selection Lists (SSBOs)
+    for (int i = 0; i < MAX_NEURAL_FEATURE_GRID_LEVELS * 2; ++i) {
+        desc.emplace_back(2, currentBinding++, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT);
+    }
+
+    // 2.22 onwards: MLP Layer Buffers (SSBOs)
+    for (int i = 0; i < MAX_MLP_LAYERS; ++i) {
+        desc.emplace_back(2, currentBinding++, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                          VK_SHADER_STAGE_FRAGMENT_BIT); // Weights
+        desc.emplace_back(2, currentBinding++, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                          VK_SHADER_STAGE_FRAGMENT_BIT); // Biases
+    }
+
+    // --- Set 3: Global Bindings ---
+    // 3.0: Environment map texture
     desc.emplace_back(3, 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                      VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_MISS_BIT_KHR);
-    desc.emplace_back(3, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT); // Palette Buffer
+                      VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_MISS_BIT_KHR | VK_SHADER_STAGE_FRAGMENT_BIT);
+    // 3.1: Neural Palette Buffer (SSBO)
+    desc.emplace_back(3, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT);
+    // 3.2: Neural VQ Codebook Buffer (SSBO)
+    desc.emplace_back(3, 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT);
 
     if (mSupportRayTracing) {
         // 4.0: Acceleration structure
@@ -800,68 +1204,117 @@ void Scene::createDescriptors()
         node.pDescriptor = std::make_unique<Descriptor>(mpDevice, desc, layout);
     }
 
-    // Materials
+    // =========================================================================
+    // Part B: Create Descriptors for Materials (Set 2)
+    // =========================================================================
+    // This is the most complex part. Each material gets its own descriptor set
+    // which holds all of its parameters, textures, and neural data buffers.
     for (auto& mat : mMaterials) {
-        std::vector<DescriptorDesc> desc;
+        std::vector<DescriptorDesc> desc; // Start a new list of bindings for this material.
+
+        // --- Binding 0: Material UBO ---
+        // Point to the shared UBO buffer for all material parameters.
         desc.emplace_back(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, mpMaterialParams);
+        // Specify that this material's data is at a specific offset within that large buffer.
         desc.back().offset = mat.paramsOffset;
         desc.back().range = sizeof(MaterialParams);
 
+        // --- Bindings 1-5: Standard Textures ---
+        // Bind the actual texture objects to the sampler slots.
         desc.emplace_back(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, mTextures[mat.diffuseTexturePath]);
         desc.emplace_back(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, mTextures[mat.specularTexturePath]);
         desc.emplace_back(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, mTextures[mat.ambientTexturePath]);
         desc.emplace_back(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, mTextures[mat.emissionTexturePath]);
         desc.emplace_back(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, mTextures[mat.normalTexturePath]);
 
-        // Add descriptors for neural VQ grids
-        if (mat.isNeuralTexture) {
-            for (int level = 0; level < MAX_NEURAL_FEATURE_GRID_LEVELS; ++level) {
-                for (int grid_type = 0; grid_type < 2; ++grid_type) {
-                    auto key = std::make_pair(level, grid_type);
-                    if (mat.neuralVQGrids.count(key) && mat.neuralVQGrids[key]) {
-                        desc.emplace_back(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, mat.neuralVQGrids[key]);
-                    } else {
-                        desc.emplace_back(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, mpMissingTexture);
-                    }
+        for (int level = 0; level < MAX_NEURAL_FEATURE_GRID_LEVELS; ++level) {
+            for (int grid_type = 0; grid_type < 2; ++grid_type) {
+                auto key = std::make_pair(level, grid_type);
+
+                // Check if a SHARED texture exists for this slot.
+                if (mHasNeuralModel && mSharedVQIndexTextures.count(key) && mSharedVQIndexTextures.at(key)) {
+                    // It does, so bind the real VQ grid texture from the scene's map.
+                    desc.emplace_back(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, mSharedVQIndexTextures.at(key));
+                } else {
+                    // It does not.
+                    // We MUST bind something to satisfy the layout, so we bind a default "missing" texture.
+                    desc.emplace_back(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, mpMissingTexture);
                 }
             }
-        } else {
-            // If not a neural texture, fill the VQ grid slots with missing texture
-            for (int i = 0; i < MAX_NEURAL_FEATURE_GRID_LEVELS * 2; ++i) {
-                desc.emplace_back(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, mpMissingTexture);
+        }
+
+        // --- Bindings 14-21: Channel Selection SSBOs (Neural) ---
+        // Same logic as above, but for the channel selection buffers.
+        for (int level = 0; level < MAX_NEURAL_FEATURE_GRID_LEVELS; ++level) {
+            for (int grid_type = 0; grid_type < 2; ++grid_type) {
+                auto key = std::make_pair(level, grid_type);
+                // Check if this material has a real buffer for this slot.
+                if (mat.neuralChannelSelectionBuffers.count(key) && mat.neuralChannelSelectionBuffers[key]) {
+                    // Bind the real SSBO containing the list of channel indices.
+                    desc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, mat.neuralChannelSelectionBuffers[key]);
+                } else {
+                    // No list for this slot. Bind the small, valid "dummy" SSBO.
+                    desc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, mpDummyStorageBuffer);
+                }
             }
         }
-        // Set layout for set 2
+
+        // --- Bindings 22+: MLP Layer Buffers (Neural) ---
+        // Loop up to the maximum number of layers the layout supports.
+        for (int i = 0; i < MAX_MLP_LAYERS; ++i) {
+            // Bind Weights
+            // Check if this material has a buffer for layer 'i'.
+            if (i < mat.mlpWeightBuffers.size() && mat.mlpWeightBuffers[i]) {
+                desc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, mat.mlpWeightBuffers[i]);
+            } else {
+                desc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, mpDummyStorageBuffer);
+            }
+            // Bind Biases
+            // Check if this material has a buffer for layer 'i'.
+            if (i < mat.mlpBiasBuffers.size() && mat.mlpBiasBuffers[i]) {
+                desc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, mat.mlpBiasBuffers[i]);
+            } else {
+                desc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, mpDummyStorageBuffer);
+            }
+        }
+
+        // Finally, get the layout for Set 2 and create the descriptor object for this material.
         auto layout = pLayout->getDescriptorSetLayouts()[2];
         mat.pDescriptor = std::make_unique<Descriptor>(mpDevice, desc, layout);
     }
 
-    std::vector<DescriptorDesc> desc;
-    // Environment map
+
+    // =========================================================================
+    // Part C: Create Global Descriptors (Set 3)
+    // =========================================================================
+    // These are resources shared by ALL materials, like the environment map
+    // and the global neural data (palette, codebook).
+    std::vector<DescriptorDesc> globalDesc;
+
+    // --- Binding 0: Environment Map ---
     if (mpEnvironmentMap) {
-        desc.emplace_back(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, mpEnvironmentMap);
-
-        // Set layout for set 3
-        auto layout = pLayout->getDescriptorSetLayouts()[3];
-        mpEnvironmentMapDescriptor = std::make_unique<Descriptor>(mpDevice, desc, layout);
+        globalDesc.emplace_back(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, mpEnvironmentMap);
+    } else {
+        globalDesc.emplace_back(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, mpMissingTexture);
     }
 
+    // --- Binding 1: Neural Palette ---
     if (mHasNeuralModel && mpPaletteBuffer) {
-
-        if (!mpEnvironmentMap && desc.empty()) {
-            desc.emplace_back(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                              mpMissingTexture); // Dummy for binding 0
-        }
-        desc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, mpPaletteBuffer);
+        globalDesc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, mpPaletteBuffer);
+    } else {
+        globalDesc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, mpDummyStorageBuffer);
     }
 
-    if (pLayout->getDescriptorSetLayouts().size() > 3) {
-        auto layoutSet3 = pLayout->getDescriptorSetLayouts()[3];
-        if (mpEnvironmentMapDescriptor)
-            mpEnvironmentMapDescriptor.reset(); // Clear old one if any
-        mpEnvironmentMapDescriptor = std::make_unique<Descriptor>(mpDevice, desc, layoutSet3);
-        Log::Info("Created descriptor for set 3 (EnvMap/Neural Globals)");
+    // --- Binding 2: Neural VQ Codebook ---
+    if (mHasNeuralModel && mpVQCodebookBuffer) {
+        globalDesc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, mpVQCodebookBuffer);
+    } else {
+        globalDesc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, mpDummyStorageBuffer);
     }
+
+    // Get the layout for Set 3 and create the single descriptor object for these global resources.
+    auto layoutSet3 = pLayout->getDescriptorSetLayouts()[3];
+    mpEnvironmentMapDescriptor = std::make_unique<Descriptor>(mpDevice, globalDesc, layoutSet3);
 
     // Add extra descriptors for ray tracing (set 4)
     if (mSupportRayTracing) {

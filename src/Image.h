@@ -49,6 +49,12 @@ namespace Mandrill
                            VkSampleCountFlagBits samples, VkFormat format, VkImageTiling tiling,
                            VkImageUsageFlags usage, VkDeviceMemory memory, VkDeviceSize offset);
 
+
+        // NTC overload
+        MANDRILL_API Image(ptr<Device> pDevice, uint32_t width, uint32_t height, uint32_t depth, uint32_t mipLevels,
+                           VkSampleCountFlagBits numSamples, VkFormat format, VkImageTiling tiling,
+                           VkImageUsageFlags usage, VkMemoryPropertyFlags properties, VkImageType imageType,
+                           uint32_t arrayLayers); // New parameters
         /// <summary>
         /// Destructor for image
         /// </summary>
@@ -61,6 +67,7 @@ namespace Mandrill
         /// <param name="aspectFlags">Aspect flags to use for image view</param>
         /// <returns></returns>
         MANDRILL_API void createImageView(VkImageAspectFlags aspectFlags);
+        MANDRILL_API void createImageView(VkImageAspectFlags aspectFlags, VkImageViewType viewType);
 
         /// <summary>
         /// Get the VkImage handle.
@@ -151,5 +158,7 @@ namespace Mandrill
         uint32_t mMipLevels;
         VkFormat mFormat;
         VkImageTiling mTiling;
+
+        uint32_t mArrayLayers;
     };
 } // namespace Mandrill
