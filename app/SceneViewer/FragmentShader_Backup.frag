@@ -153,6 +153,7 @@ vec4 evaluate_neural_texture(vec2 uv, float lod) {
     
     vec2 frac_coords;
 
+    // --- 2. Grid 0 Feature Gathering (4 scaled features per channel) ---
     uint num_selections_g0 = materialParams.channelCounts[level_idx][0];
     if (num_selections_g0 > 0) {
         uvec3 grid_dims = materialParams.featureGridShapes[level_idx][0].xyz;
@@ -195,8 +196,138 @@ vec4 evaluate_neural_texture(vec2 uv, float lod) {
             features[feature_count++] = f01 * w01;
             features[feature_count++] = f11 * w11;
         }
+    }
 
-        return vec4(0.0,1.0,0.0,1.0); // Green working color
+    // --- 3. Grid 1 Feature Gathering (1 interpolated feature per channel) ---
+    uint num_selections_g1 = materialParams.channelCounts[level_idx][1];
+    if (num_selections_g1 > 0) {
+        uvec3 grid_dims = materialParams.featureGridShapes[level_idx][1].xyz;
+        vec2 grid_coords = uv * vec2(grid_dims.z, grid_dims.y);
+        ivec2 base_coords_int = ivec2(floor(grid_coords - 0.5));
+        vec2 current_frac_coords = fract(grid_coords - 0.5);
+
+        if (num_selections_g0 == 0) {
+            frac_coords = current_frac_coords;
+        }
+
+        for (int i = 0; i < num_selections_g1; ++i) {
+            uint channel_to_sample;
+            uint vq_idx_00, vq_idx_10, vq_idx_01, vq_idx_11;
+
+            ivec2 n00 = (base_coords_int + ivec2(0,0)) % ivec2(grid_dims.z, grid_dims.y);
+            ivec2 n10 = (base_coords_int + ivec2(1,0)) % ivec2(grid_dims.z, grid_dims.y);
+            ivec2 n01 = (base_coords_int + ivec2(0,1)) % ivec2(grid_dims.z, grid_dims.y);
+            ivec2 n11 = (base_coords_int + ivec2(1,1)) % ivec2(grid_dims.z, grid_dims.y);
+
+            switch(level_idx) {
+                case 0:
+                    channel_to_sample = uint(grid1l0_channels.indices[i]);
+                    vq_idx_00 = uint(texelFetch(neuralVQGridL0G1, ivec3(n00, channel_to_sample), 0).r);
+                    vq_idx_10 = uint(texelFetch(neuralVQGridL0G1, ivec3(n10, channel_to_sample), 0).r);
+                    vq_idx_01 = uint(texelFetch(neuralVQGridL0G1, ivec3(n01, channel_to_sample), 0).r);
+                    vq_idx_11 = uint(texelFetch(neuralVQGridL0G1, ivec3(n11, channel_to_sample), 0).r);
+                    break;
+                case 1:
+                    channel_to_sample = uint(grid1l1_channels.indices[i]);
+                    vq_idx_00 = uint(texelFetch(neuralVQGridL1G1, ivec3(n00, channel_to_sample), 0).r);
+                    vq_idx_10 = uint(texelFetch(neuralVQGridL1G1, ivec3(n10, channel_to_sample), 0).r);
+                    vq_idx_01 = uint(texelFetch(neuralVQGridL1G1, ivec3(n01, channel_to_sample), 0).r);
+                    vq_idx_11 = uint(texelFetch(neuralVQGridL1G1, ivec3(n11, channel_to_sample), 0).r);
+                    break;
+                case 2:
+                    channel_to_sample = uint(grid1l2_channels.indices[i]);
+                    vq_idx_00 = uint(texelFetch(neuralVQGridL2G1, ivec3(n00, channel_to_sample), 0).r);
+                    vq_idx_10 = uint(texelFetch(neuralVQGridL2G1, ivec3(n10, channel_to_sample), 0).r);
+                    vq_idx_01 = uint(texelFetch(neuralVQGridL2G1, ivec3(n01, channel_to_sample), 0).r);
+                    vq_idx_11 = uint(texelFetch(neuralVQGridL2G1, ivec3(n11, channel_to_sample), 0).r);
+                    break;
+                case 3:
+                    channel_to_sample = uint(grid1l3_channels.indices[i]);
+                    vq_idx_00 = uint(texelFetch(neuralVQGridL3G1, ivec3(n00, channel_to_sample), 0).r);
+                    vq_idx_10 = uint(texelFetch(neuralVQGridL3G1, ivec3(n10, channel_to_sample), 0).r);
+                    vq_idx_01 = uint(texelFetch(neuralVQGridL3G1, ivec3(n01, channel_to_sample), 0).r);
+                    vq_idx_11 = uint(texelFetch(neuralVQGridL3G1, ivec3(n11, channel_to_sample), 0).r);
+                    break;
+            }
+            
+            vec2 patch_coords = current_frac_coords * 4.0;
+            ivec2 patch_base_int = ivec2(floor(patch_coords));
+            vec2 patch_frac = fract(patch_coords);
+
+            uint p_idx00 = uint(clamp(patch_base_int.y,     0, 3)) * 4 + uint(clamp(patch_base_int.x,     0, 3));
+            uint p_idx10 = uint(clamp(patch_base_int.y,     0, 3)) * 4 + uint(clamp(patch_base_int.x + 1, 0, 3));
+            uint p_idx01 = uint(clamp(patch_base_int.y + 1, 0, 3)) * 4 + uint(clamp(patch_base_int.x,     0, 3));
+            uint p_idx11 = uint(clamp(patch_base_int.y + 1, 0, 3)) * 4 + uint(clamp(patch_base_int.x + 1, 0, 3));
+
+            float feat_00 = mix(get_feature_from_codebook(vq_idx_00, p_idx00), get_feature_from_codebook(vq_idx_00, p_idx10), patch_frac.x);
+            float feat_01 = mix(get_feature_from_codebook(vq_idx_00, p_idx01), get_feature_from_codebook(vq_idx_00, p_idx11), patch_frac.x);
+            float v0 = mix(feat_00, feat_01, patch_frac.y);
+
+            float feat_10 = mix(get_feature_from_codebook(vq_idx_10, p_idx00), get_feature_from_codebook(vq_idx_10, p_idx10), patch_frac.x);
+            float feat_11 = mix(get_feature_from_codebook(vq_idx_10, p_idx01), get_feature_from_codebook(vq_idx_10, p_idx11), patch_frac.x);
+            float v1 = mix(feat_10, feat_11, patch_frac.y);
+            
+            float feat_20 = mix(get_feature_from_codebook(vq_idx_01, p_idx00), get_feature_from_codebook(vq_idx_01, p_idx10), patch_frac.x);
+            float feat_21 = mix(get_feature_from_codebook(vq_idx_01, p_idx01), get_feature_from_codebook(vq_idx_01, p_idx11), patch_frac.x);
+            float v2 = mix(feat_20, feat_21, patch_frac.y);
+            
+            float feat_30 = mix(get_feature_from_codebook(vq_idx_11, p_idx00), get_feature_from_codebook(vq_idx_11, p_idx10), patch_frac.x);
+            float feat_31 = mix(get_feature_from_codebook(vq_idx_11, p_idx01), get_feature_from_codebook(vq_idx_11, p_idx11), patch_frac.x);
+            float v3 = mix(feat_30, feat_31, patch_frac.y);
+            
+            float interp_x1 = mix(v0, v1, current_frac_coords.x);
+            float interp_x2 = mix(v2, v3, current_frac_coords.x);
+            features[feature_count++] = mix(interp_x1, interp_x2, current_frac_coords.y);
+        }
+    }
+    
+    // --- 4. Append Positional Encoding & LOD ---
+    if(num_selections_g0 > 0 || num_selections_g1 > 0){
+        append_positional_encoding(features, feature_count, frac_coords);
+    }
+    features[feature_count++] = lod;
+
+    // --- 5. Run the MLP (Decoder) ---
+    if (feature_count > 0) {
+        // ---- Layer 0 ----
+        uint layer0_out_channels = mlpL0_B.data.length();
+        uint layer0_in_channels_expected = mlpL0_W.data.length() / layer0_out_channels;
+        float layer0_activations[32];
+        for(int out_ch = 0; out_ch < layer0_out_channels; ++out_ch) {
+            float accumulator = mlpL0_B.data[out_ch];
+            for(int in_ch = 0; in_ch < min(feature_count, int(layer0_in_channels_expected)); ++in_ch) {
+                accumulator += features[in_ch] * mlpL0_W.data[out_ch * layer0_in_channels_expected + in_ch];
+            }
+            layer0_activations[out_ch] = max(0.0, accumulator);
+        }
+
+        // ---- Layer 1 ----
+        uint layer1_out_channels = mlpL1_B.data.length();
+        uint layer1_in_channels_expected = mlpL1_W.data.length() / layer1_out_channels;
+        float layer1_activations[32];
+        for(int out_ch = 0; out_ch < layer1_out_channels; ++out_ch) {
+            float accumulator = mlpL1_B.data[out_ch];
+            for(int in_ch = 0; in_ch < min(int(layer0_out_channels), int(layer1_in_channels_expected)); ++in_ch) {
+                accumulator += layer0_activations[in_ch] * mlpL1_W.data[out_ch * layer1_in_channels_expected + in_ch];
+            }
+            layer1_activations[out_ch] = max(0.0, accumulator);
+        }
+        
+        // ---- Layer 2 (Final Layer) ----
+        uint final_out_channels = mlpL2_B.data.length();
+        uint final_in_channels_expected = mlpL2_W.data.length() / final_out_channels;
+        vec4 final_color = vec4(0.0, 0.0, 0.0, 1.0);
+        for(int out_ch = 0; out_ch < final_out_channels; ++out_ch) {
+            float accumulator = mlpL2_B.data[out_ch];
+            for(int in_ch = 0; in_ch < min(int(layer1_out_channels), int(final_in_channels_expected)); ++in_ch) {
+                accumulator += layer1_activations[in_ch] * mlpL2_W.data[out_ch * final_in_channels_expected + in_ch];
+            }
+            if(out_ch < 4) {
+              final_color[out_ch] = accumulator;
+            }
+        }
+        
+        return final_color;
     }
 
     return vec4(1.0, 0.0, 1.0, 1.0); // Magenta error color

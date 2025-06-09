@@ -606,103 +606,6 @@ void Scene::compile()
         Log::Error("Scene: Sampler must be set before calling compile()");
     }
 
-    // Calculate size of buffers
-    size_t verticesSize = 0;
-    size_t indicesSize = 0;
-    for (auto& node : mNodes) {
-        for (auto meshIndex : node.mMeshIndices) {
-            auto& mesh = mMeshes[meshIndex];
-            verticesSize += sizeof(Vertex) * mesh.vertices.size();
-            indicesSize += sizeof(uint32_t) * mesh.indices.size();
-        }
-    }
-
-    // Allocate device buffers
-    mpVertexBuffer =
-        make_ptr<Buffer>(mpDevice, verticesSize,
-                         VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
-                             VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                             VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
-                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    mpIndexBuffer =
-        make_ptr<Buffer>(mpDevice, indicesSize,
-                         VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                             VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                             VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
-                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-
-    uint32_t copies = mpSwapchain->getFramesInFlightCount();
-
-    VkDeviceSize alignment = mpDevice->getProperties().physicalDevice.limits.minUniformBufferOffsetAlignment;
-
-    // Transforms can change between frames, material parameters can not
-    VkDeviceSize transformsSize = Helpers::alignTo(sizeof(glm::mat4), alignment) * mNodes.size() * copies;
-    mpTransforms = make_ptr<Buffer>(mpDevice, transformsSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-                                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-
-    VkDeviceSize materialParamsSize = Helpers::alignTo(sizeof(MaterialParams), alignment) * mMaterials.size();
-    mpMaterialParams = make_ptr<Buffer>(mpDevice, materialParamsSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-                                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-
-    // Associate each node with a part of the transforms buffer, and with multiple copies for each frame in flight
-    glm::mat4* transforms = static_cast<glm::mat4*>(mpTransforms->getHostMap());
-    for (uint32_t i = 0; i < count(mNodes); i++) {
-        mNodes[i].mpTransformDevice = transforms + i * copies;
-        for (uint32_t c = 0; c < copies; c++) {
-            *(mNodes[i].mpTransformDevice + c) = glm::mat4(1.0f);
-        }
-    }
-
-    // Associate each material with a part of the material params buffer
-    MaterialParams* materialParams = static_cast<MaterialParams*>(mpMaterialParams->getHostMap());
-    for (uint32_t i = 0; i < count(mMaterials); i++) {
-        mMaterials[i].paramsDevice = materialParams + i;
-        *mMaterials[i].paramsDevice = mMaterials[i].params;
-        mMaterials[i].paramsOffset = Helpers::alignTo(i * sizeof(MaterialParams), alignment);
-    }
-
-    if (mSupportRayTracing) {
-        VkDeviceSize materialBufferSize = sizeof(MaterialDevice) * mMaterials.size();
-        mpMaterialBuffer = make_ptr<Buffer>(mpDevice, materialBufferSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                                            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-
-        MaterialDevice* materials = static_cast<MaterialDevice*>(mpMaterialBuffer->getHostMap());
-        for (uint32_t i = 0; i < count(mMaterials); i++) {
-            memcpy(&materials[i].params, materialParams + i, sizeof(MaterialParams));
-            materials[i].diffuseTextureIndex = static_cast<uint32_t>(
-                std::distance(mTextures.begin(), mTextures.find(mMaterials[i].diffuseTexturePath)));
-            materials[i].specularTextureIndex = static_cast<uint32_t>(
-                std::distance(mTextures.begin(), mTextures.find(mMaterials[i].specularTexturePath)));
-            materials[i].ambientTextureIndex = static_cast<uint32_t>(
-                std::distance(mTextures.begin(), mTextures.find(mMaterials[i].ambientTexturePath)));
-            materials[i].emissionTextureIndex = static_cast<uint32_t>(
-                std::distance(mTextures.begin(), mTextures.find(mMaterials[i].emissionTexturePath)));
-            materials[i].normalTextureIndex = static_cast<uint32_t>(
-                std::distance(mTextures.begin(), mTextures.find(mMaterials[i].normalTexturePath)));
-        }
-
-        VkDeviceSize instanceDataBufferSize = sizeof(InstanceData) * mMeshes.size();
-        mpInstanceDataBuffer = make_ptr<Buffer>(mpDevice, instanceDataBufferSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                                                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        InstanceData* instanceData = static_cast<InstanceData*>(mpInstanceDataBuffer->getHostMap());
-        uint32_t instanceIndex = 0;
-        uint32_t verticesOffset = 0;
-        uint32_t indicesOffset = 0;
-        for (auto& node : mNodes) {
-            for (auto& meshIndex : node.getMeshIndices()) {
-                auto& mesh = mMeshes[meshIndex];
-
-                instanceData[instanceIndex].verticesOffset = verticesOffset;
-                instanceData[instanceIndex].indicesOffset = indicesOffset;
-
-                verticesOffset += count(mesh.vertices);
-                indicesOffset += count(mesh.indices);
-
-                instanceIndex += 1;
-            }
-        }
-    }
-
     if (mHasNeuralModel) {
         Log::Info("Compiling scene with Neural Model data...");
 
@@ -778,7 +681,7 @@ void Scene::compile()
 
                                     // Create the flattened 2D texture
                                     ptr<Texture> pGridTexture =
-                                        make_ptr<Texture>(mpDevice, Texture::Type::Texture2DArray, VK_FORMAT_R8_UINT,
+                                        make_ptr<Texture>(mpDevice, Texture::Type::Texture2D, VK_FORMAT_R8_UINT,
                                                           fgd.data_uint8.data(), width, height, channels, 1, false);
 
                                     if (m_pLastSetSamplerInScene) {
@@ -826,114 +729,118 @@ void Scene::compile()
                         }
                     }
                 }
-            }
 
-            Log::Info("Processing neural data for material: {}", mat.name);
-            const MaterialSpecificData& specific_mat_data = *mat.pCpuNeuralMaterialData;
+                Log::Info("Processing neural data for material: {}", mat.name);
+                const MaterialSpecificData& specific_mat_data = *mat.pCpuNeuralMaterialData;
 
-            // --- Channel Selection Data ---
-            for (int l = 0; l < MAX_NEURAL_FEATURE_GRID_LEVELS; ++l) {
-                auto it = specific_mat_data.level_channel_selections.find(l);
-                if (it != specific_mat_data.level_channel_selections.end()) {
-                    const ChannelSelections& selections = it->second;
+                // --- Channel Selection Data ---
+                for (int l = 0; l < MAX_NEURAL_FEATURE_GRID_LEVELS; ++l) {
+                    auto it = specific_mat_data.level_channel_selections.find(l);
+                    if (it != specific_mat_data.level_channel_selections.end()) {
+                        const ChannelSelections& selections = it->second;
 
-                    // Grid 0
-                    mat.params.channelCounts[l][0] = selections.grid0_selected_channels.size();
-                    if (!selections.grid0_selected_channels.empty()) {
-                        VkDeviceSize bufferSize = sizeof(uint16_t) * selections.grid0_selected_channels.size();
+                        // Grid 0
+                        mat.params.channelCounts[l][0] = selections.grid0_selected_channels.size();
+                        if (!selections.grid0_selected_channels.empty()) {
+                            VkDeviceSize bufferSize = sizeof(uint16_t) * selections.grid0_selected_channels.size();
+                            ptr<Buffer> pGpuBuffer =
+                                make_ptr<Buffer>(mpDevice, bufferSize,
+                                                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                            ptr<Buffer> pStaging = make_ptr<Buffer>(
+                                mpDevice, bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                            pStaging->copyFromHost(selections.grid0_selected_channels.data(), bufferSize);
+                            executeSingleTimeCommands(mpDevice, [&](VkCommandBuffer cmd) {
+                                VkBufferCopy cr{};
+                                cr.size = bufferSize;
+                                vkCmdCopyBuffer(cmd, pStaging->getBuffer(), pGpuBuffer->getBuffer(), 1, &cr);
+                            });
+                            mat.neuralChannelSelectionBuffers[{l, 0}] = pGpuBuffer;
+                            Log::Debug("Uploaded channel selection for '{}' L{}G0: {} indices", mat.name, l,
+                                       selections.grid0_selected_channels.size());
+                        }
+
+                        // Grid 1
+                        mat.params.channelCounts[l][1] = selections.grid1_selected_channels.size();
+                        if (!selections.grid1_selected_channels.empty()) {
+                            VkDeviceSize bufferSize = sizeof(uint16_t) * selections.grid1_selected_channels.size();
+                            ptr<Buffer> pGpuBuffer =
+                                make_ptr<Buffer>(mpDevice, bufferSize,
+                                                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                            ptr<Buffer> pStaging = make_ptr<Buffer>(
+                                mpDevice, bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                            pStaging->copyFromHost(selections.grid1_selected_channels.data(), bufferSize);
+                            executeSingleTimeCommands(mpDevice, [&](VkCommandBuffer cmd) {
+                                VkBufferCopy cr{};
+                                cr.size = bufferSize;
+                                vkCmdCopyBuffer(cmd, pStaging->getBuffer(), pGpuBuffer->getBuffer(), 1, &cr);
+                            });
+                            mat.neuralChannelSelectionBuffers[{l, 1}] = pGpuBuffer;
+                            Log::Debug("Uploaded channel selection for '{}' L{}G1: {} indices", mat.name, l,
+                                       selections.grid1_selected_channels.size());
+                        }
+                    } else {
+                        // No selections for this level
+                        mat.params.channelCounts[l][0] = 0;
+                        mat.params.channelCounts[l][1] = 0;
+                    }
+                }
+
+                // --- MLP Layer Data ---
+                if (specific_mat_data.mlp_layers.size() > MAX_MLP_LAYERS) {
+                    Log::Warning("Material '{}' has {} MLP layers, but layout only supports {}. Truncating.", mat.name,
+                                 specific_mat_data.mlp_layers.size(), MAX_MLP_LAYERS);
+                }
+                for (const MLPLayer& sm_layer : specific_mat_data.mlp_layers) {
+                    if (mat.mlpWeightBuffers.size() >= MAX_MLP_LAYERS)
+                        break; // Adhere to layout limit
+
+                    // Weights
+                    if (!sm_layer.weights_raw_bytes.empty()) {
+                        VkDeviceSize bufferSize = sm_layer.weights_raw_bytes.size();
                         ptr<Buffer> pGpuBuffer = make_ptr<Buffer>(
                             mpDevice, bufferSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
                         ptr<Buffer> pStaging = make_ptr<Buffer>(mpDevice, bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                                                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                                                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-                        pStaging->copyFromHost(selections.grid0_selected_channels.data(), bufferSize);
+                        pStaging->copyFromHost(sm_layer.weights_raw_bytes.data(), bufferSize);
                         executeSingleTimeCommands(mpDevice, [&](VkCommandBuffer cmd) {
                             VkBufferCopy cr{};
                             cr.size = bufferSize;
                             vkCmdCopyBuffer(cmd, pStaging->getBuffer(), pGpuBuffer->getBuffer(), 1, &cr);
                         });
-                        mat.neuralChannelSelectionBuffers[{l, 0}] = pGpuBuffer;
-                        Log::Debug("Uploaded channel selection for '{}' L{}G0: {} indices", mat.name, l,
-                                   selections.grid0_selected_channels.size());
+                        mat.mlpWeightBuffers.push_back(pGpuBuffer);
+                        Log::Debug("Uploaded MLP L{} weights for '{}', {} bytes", sm_layer.layer_idx, mat.name,
+                                   bufferSize);
+                    } else {
+                        mat.mlpWeightBuffers.push_back(nullptr); // Push null to keep indices aligned
                     }
 
-                    // Grid 1
-                    mat.params.channelCounts[l][1] = selections.grid1_selected_channels.size();
-                    if (!selections.grid1_selected_channels.empty()) {
-                        VkDeviceSize bufferSize = sizeof(uint16_t) * selections.grid1_selected_channels.size();
+                    // Bias
+                    if (!sm_layer.bias_raw_bytes.empty()) {
+                        VkDeviceSize bufferSize = sm_layer.bias_raw_bytes.size();
                         ptr<Buffer> pGpuBuffer = make_ptr<Buffer>(
                             mpDevice, bufferSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
                         ptr<Buffer> pStaging = make_ptr<Buffer>(mpDevice, bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                                                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                                                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-                        pStaging->copyFromHost(selections.grid1_selected_channels.data(), bufferSize);
+                        pStaging->copyFromHost(sm_layer.bias_raw_bytes.data(), bufferSize);
                         executeSingleTimeCommands(mpDevice, [&](VkCommandBuffer cmd) {
                             VkBufferCopy cr{};
                             cr.size = bufferSize;
                             vkCmdCopyBuffer(cmd, pStaging->getBuffer(), pGpuBuffer->getBuffer(), 1, &cr);
                         });
-                        mat.neuralChannelSelectionBuffers[{l, 1}] = pGpuBuffer;
-                        Log::Debug("Uploaded channel selection for '{}' L{}G1: {} indices", mat.name, l,
-                                   selections.grid1_selected_channels.size());
+                        mat.mlpBiasBuffers.push_back(pGpuBuffer);
+                        Log::Debug("Uploaded MLP L{} bias for '{}', {} bytes", sm_layer.layer_idx, mat.name,
+                                   bufferSize);
+                    } else {
+                        mat.mlpBiasBuffers.push_back(nullptr); // Push null to keep indices aligned
                     }
-                } else {
-                    // No selections for this level
-                    mat.params.channelCounts[l][0] = 0;
-                    mat.params.channelCounts[l][1] = 0;
-                }
-            }
-
-            // --- MLP Layer Data ---
-            if (specific_mat_data.mlp_layers.size() > MAX_MLP_LAYERS) {
-                Log::Warning("Material '{}' has {} MLP layers, but layout only supports {}. Truncating.", mat.name,
-                             specific_mat_data.mlp_layers.size(), MAX_MLP_LAYERS);
-            }
-            for (const MLPLayer& sm_layer : specific_mat_data.mlp_layers) {
-                if (mat.mlpWeightBuffers.size() >= MAX_MLP_LAYERS)
-                    break; // Adhere to layout limit
-
-                // Weights
-                if (!sm_layer.weights_raw_bytes.empty()) {
-                    VkDeviceSize bufferSize = sm_layer.weights_raw_bytes.size();
-                    ptr<Buffer> pGpuBuffer = make_ptr<Buffer>(
-                        mpDevice, bufferSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-                    ptr<Buffer> pStaging =
-                        make_ptr<Buffer>(mpDevice, bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-                    pStaging->copyFromHost(sm_layer.weights_raw_bytes.data(), bufferSize);
-                    executeSingleTimeCommands(mpDevice, [&](VkCommandBuffer cmd) {
-                        VkBufferCopy cr{};
-                        cr.size = bufferSize;
-                        vkCmdCopyBuffer(cmd, pStaging->getBuffer(), pGpuBuffer->getBuffer(), 1, &cr);
-                    });
-                    mat.mlpWeightBuffers.push_back(pGpuBuffer);
-                    Log::Debug("Uploaded MLP L{} weights for '{}', {} bytes", sm_layer.layer_idx, mat.name, bufferSize);
-                } else {
-                    mat.mlpWeightBuffers.push_back(nullptr); // Push null to keep indices aligned
-                }
-
-                // Bias
-                if (!sm_layer.bias_raw_bytes.empty()) {
-                    VkDeviceSize bufferSize = sm_layer.bias_raw_bytes.size();
-                    ptr<Buffer> pGpuBuffer = make_ptr<Buffer>(
-                        mpDevice, bufferSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-                    ptr<Buffer> pStaging =
-                        make_ptr<Buffer>(mpDevice, bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-                    pStaging->copyFromHost(sm_layer.bias_raw_bytes.data(), bufferSize);
-                    executeSingleTimeCommands(mpDevice, [&](VkCommandBuffer cmd) {
-                        VkBufferCopy cr{};
-                        cr.size = bufferSize;
-                        vkCmdCopyBuffer(cmd, pStaging->getBuffer(), pGpuBuffer->getBuffer(), 1, &cr);
-                    });
-                    mat.mlpBiasBuffers.push_back(pGpuBuffer);
-                    Log::Debug("Uploaded MLP L{} bias for '{}', {} bytes", sm_layer.layer_idx, mat.name, bufferSize);
-                } else {
-                    mat.mlpBiasBuffers.push_back(nullptr); // Push null to keep indices aligned
                 }
             }
         }
@@ -942,8 +849,6 @@ void Scene::compile()
         Log::Info("No Neural Model data to process for scene compilation.");
     }
 
-    // --- Original Mandrill Scene::compile() logic STARTS here ---
-    // (This part was previously missing or misplaced)
     mVertexCount = 0;
     mIndexCount = 0;
     for (const auto& mesh : mMeshes) {
@@ -953,51 +858,66 @@ void Scene::compile()
 
     Log::Info("Compiling scene with {} meshes, {} vertices and {} indices", count(mMeshes), mVertexCount, mIndexCount);
 
+    // Define usage flags based on whether RT is supported
+    VkBufferUsageFlags vertexBufferUsage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    VkBufferUsageFlags indexBufferUsage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    if (mSupportRayTracing) {
+        vertexBufferUsage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                             VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+        indexBufferUsage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                            VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+    }
+
+    // Allocate Host-Visible buffers for the rasterization path
     if (mVertexCount > 0) {
-        mpVertexBuffer = make_ptr<Buffer>(mpDevice, sizeof(Vertex) * mVertexCount,
-                                          VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                                              VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
-                                              VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
+        mpVertexBuffer = make_ptr<Buffer>(mpDevice, sizeof(Vertex) * mVertexCount, vertexBufferUsage,
                                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     }
     if (mIndexCount > 0) {
-        mpIndexBuffer = make_ptr<Buffer>(mpDevice, sizeof(uint32_t) * mIndexCount,
-                                         VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                                             VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
-                                             VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
+        mpIndexBuffer = make_ptr<Buffer>(mpDevice, sizeof(uint32_t) * mIndexCount, indexBufferUsage,
                                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     }
-    mpTransforms = make_ptr<Buffer>(mpDevice, sizeof(glm::mat4) * count(mNodes) * mpSwapchain->getImages().size(),
-                                    VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-                                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    mpMaterialParams =
-        make_ptr<Buffer>(mpDevice, sizeof(MaterialParams) * count(mMaterials), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
-    // Associate each material with a part of the material params buffer
+    // Allocate Transform and Material UBOs
+    uint32_t copies = mpSwapchain->getFramesInFlightCount();
+    VkDeviceSize alignment = mpDevice->getProperties().physicalDevice.limits.minUniformBufferOffsetAlignment;
+
+    VkDeviceSize transformsSize = Helpers::alignTo(sizeof(glm::mat4), alignment) * mNodes.size() * copies;
+    mpTransforms = make_ptr<Buffer>(mpDevice, transformsSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+    VkDeviceSize materialParamsSize = Helpers::alignTo(sizeof(MaterialParams), alignment) * mMaterials.size();
+    mpMaterialParams = make_ptr<Buffer>(mpDevice, materialParamsSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+    // Associate nodes with the transform buffer (FIXES DANGLING POINTER)
+    glm::mat4* transforms_ptr = static_cast<glm::mat4*>(mpTransforms->getHostMap());
+    for (uint32_t i = 0; i < count(mNodes); i++) {
+        mNodes[i].mpTransformDevice = transforms_ptr + i * copies;
+    }
+
+    // Associate materials with the material params buffer and copy final data
     MaterialParams* materialParams_ptr = static_cast<MaterialParams*>(mpMaterialParams->getHostMap());
     for (uint32_t i = 0; i < count(mMaterials); i++) {
         mMaterials[i].paramsDevice = materialParams_ptr + i;
-        // mMaterials[i].params.isNeuralTexture is already set if linked in loadNeuralModel
-        // If not linked, it should be 0.
-        if (!mMaterials[i].isNeuralTexture)
-            mMaterials[i].params.isNeuralTexture = 0;
+        mMaterials[i].paramsOffset =
+            i * Helpers::alignTo(sizeof(MaterialParams), alignment); // Note: Offset calculation was slightly off before
 
-        *(mMaterials[i].paramsDevice) =
-            mMaterials[i].params; // This copies the potentially updated isNeuralTexture flag
-        mMaterials[i].paramsOffset = Helpers::alignTo(i * sizeof(MaterialParams), alignment);
+        // This is now the final update after neural processing has modified mat.params
+        *(mMaterials[i].paramsDevice) = mMaterials[i].params;
     }
 
+    // Create dummy buffer for unused descriptor slots
     if (!mpDummyStorageBuffer) {
         const uint32_t dummyData = 0;
+        mpDummyStorageBuffer = make_ptr<Buffer>(mpDevice, sizeof(dummyData),
+                                                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
         ptr<Buffer> pStagingBuffer =
             make_ptr<Buffer>(mpDevice, sizeof(dummyData), VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
         pStagingBuffer->copyFromHost(&dummyData, sizeof(dummyData));
-
-        mpDummyStorageBuffer = make_ptr<Buffer>(mpDevice, sizeof(dummyData),
-                                                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                                                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
         executeSingleTimeCommands(mpDevice, [&](VkCommandBuffer cmd) {
             VkBufferCopy copyRegion{};
@@ -1283,7 +1203,6 @@ void Scene::createDescriptors()
         mat.pDescriptor = std::make_unique<Descriptor>(mpDevice, desc, layout);
     }
 
-
     // =========================================================================
     // Part C: Create Global Descriptors (Set 3)
     // =========================================================================
@@ -1315,6 +1234,7 @@ void Scene::createDescriptors()
     // Get the layout for Set 3 and create the single descriptor object for these global resources.
     auto layoutSet3 = pLayout->getDescriptorSetLayouts()[3];
     mpEnvironmentMapDescriptor = std::make_unique<Descriptor>(mpDevice, globalDesc, layoutSet3);
+    Log::Info("Created descriptors Successfully.");
 
     // Add extra descriptors for ray tracing (set 4)
     if (mSupportRayTracing) {

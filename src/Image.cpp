@@ -9,7 +9,7 @@ Image::Image(ptr<Device> pDevice, uint32_t width, uint32_t height, uint32_t dept
              VkSampleCountFlagBits samples, VkFormat format, VkImageTiling tiling, VkImageUsageFlags usage,
              VkMemoryPropertyFlags properties)
     : mpDevice(pDevice), mWidth(width), mHeight(height), mDepth(depth), mMipLevels(mipLevels), mFormat(format),
-      mTiling(tiling), mImageView(VK_NULL_HANDLE)
+      mTiling(tiling), mImageView(VK_NULL_HANDLE), mArrayLayers(1)
 {
     VkImageCreateInfo ci = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
@@ -49,7 +49,7 @@ Image::Image(ptr<Device> pDevice, uint32_t width, uint32_t height, uint32_t dept
              VkSampleCountFlagBits samples, VkFormat format, VkImageTiling tiling, VkImageUsageFlags usage,
              VkDeviceMemory memory, VkDeviceSize offset)
     : mpDevice(pDevice), mWidth(width), mHeight(height), mDepth(depth), mMipLevels(mipLevels), mFormat(format),
-      mTiling(tiling), mImageView(VK_NULL_HANDLE), mMemory(memory)
+      mTiling(tiling), mImageView(VK_NULL_HANDLE), mMemory(memory), mArrayLayers(1)
 {
     VkImageCreateInfo ci = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
@@ -78,7 +78,7 @@ Image::Image(ptr<Device> pDevice, uint32_t width, uint32_t height, uint32_t dept
              VkSampleCountFlagBits samples, VkFormat format, VkImageTiling tiling, VkImageUsageFlags usage,
              VkMemoryPropertyFlags properties, VkImageType imageType, uint32_t arrayLayers)
     : mpDevice(pDevice), mWidth(width), mHeight(height), mDepth(depth), mMipLevels(mipLevels), mFormat(format),
-      mTiling(tiling), mImageView(VK_NULL_HANDLE), mMemory(VK_NULL_HANDLE)
+      mTiling(tiling), mImageView(VK_NULL_HANDLE), mMemory(VK_NULL_HANDLE), mArrayLayers(arrayLayers)
 {
     VkImageCreateInfo ci = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,

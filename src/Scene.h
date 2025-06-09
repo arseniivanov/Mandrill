@@ -54,15 +54,25 @@ namespace Mandrill
     struct alignas(16) MaterialParams {
         glm::vec3 diffuse;
         float shininess;
+
         glm::vec3 specular;
         float indexOfRefraction;
+
         glm::vec3 ambient;
         float opacity;
+
         glm::vec3 emission;
         uint32_t hasTexture;
+
         uint32_t isNeuralTexture;
+        float pad0;
+        float pad1;
+        float pad2;
+
         uint32_t channelCounts[MAX_NEURAL_FEATURE_GRID_LEVELS][2];
-        glm::uvec3 featureGridShapes[MAX_NEURAL_FEATURE_GRID_LEVELS][2];
+        float pad3;
+
+        glm::uvec4 featureGridShapes[MAX_NEURAL_FEATURE_GRID_LEVELS][2];
     };
 
     struct alignas(16) MaterialDevice {
