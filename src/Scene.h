@@ -521,7 +521,8 @@ namespace Mandrill
         ptr<Sampler> m_pLastSetSamplerInScene;
 
         ptr<Buffer> mpPaletteBuffer;
-        ptr<Buffer> mpVQCodebookBuffer;                                     // For "vq_codebook_patches_packed_uint8"
+        ptr<Buffer> mpVQCodebookBuffer; // For "vq_codebook_patches_packed_uint8"
+        ptr<Buffer> mpPositionalEncodingBuffer;
         std::map<std::pair<int, int>, ptr<Texture>> mSharedVQIndexTextures; // Key: {level_idx, grid_type}
         std::map<std::pair<int, int>, glm::ivec2> mSharedVQIndexShapes;     // Key: {level_idx, grid_type}
         std::unordered_map<std::pair<int, int>, glm::uvec4, pair_hash> mSharedVQIndexOriginalShapes;

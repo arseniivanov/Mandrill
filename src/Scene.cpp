@@ -602,6 +602,35 @@ void executeSingleTimeCommands(Mandrill::ptr<Mandrill::Device> device, std::func
     vkFreeCommandBuffers(vkDevice, commandPool, 1, &commandBuffer);
 }
 
+void createPositionalEncodingData(std::vector<float>& outData)
+{
+    const int TABLE_SIZE = 8;       // The data repeats over an 8-unit grid
+    const int FEATURES_PER_DIM = 5; // 3 octaves * 2 offsets - 1 skipped pair
+
+    outData.resize(TABLE_SIZE * FEATURES_PER_DIM);
+
+    auto tri = [](float x, float offset) { return (2.0f * std::abs(fmod(x - offset, 2.0f) - 1.0f) - 1.0f); };
+
+    // We loop over table positions first to create a "row-major" buffer layout.
+    // This makes shader lookups much cleaner: buffer[position * num_features + feature_index]
+    for (int pos = 0; pos < TABLE_SIZE; ++pos) {
+        int feature_idx = 0;
+        for (int octave = 0; octave < 3; ++octave) {
+            float div = static_cast<float>(1 << octave);
+            for (int i = 0; i < 2; ++i) {
+                float offset = (i == 0) ? 0.5f : 0.0f;
+                if (octave == 0 && i == 0) {
+                    continue; // Skip the first pair as in the shader
+                }
+
+                float value = tri(static_cast<float>(pos) / div, offset);
+                outData[pos * FEATURES_PER_DIM + feature_idx] = value;
+                feature_idx++;
+            }
+        }
+    }
+}
+
 void Scene::compile()
 {
     if (mpMissingTexture->getSampler() == VK_NULL_HANDLE) {
@@ -610,6 +639,26 @@ void Scene::compile()
 
     if (mHasNeuralModel) {
         Log::Info("Compiling scene with Neural Model data...");
+
+        std::vector<float> posEncodingData;
+        createPositionalEncodingData(posEncodingData);
+        VkDeviceSize posEncBufferSize = sizeof(float) * posEncodingData.size();
+        if (posEncBufferSize > 0) {
+            mpPositionalEncodingBuffer = make_ptr<Buffer>(
+                mpDevice, posEncBufferSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            ptr<Buffer> pStagingBuffer =
+                make_ptr<Buffer>(mpDevice, posEncBufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            pStagingBuffer->copyFromHost(posEncodingData.data(), posEncBufferSize, 0);
+            executeSingleTimeCommands(mpDevice, [&](VkCommandBuffer cmd) {
+                VkBufferCopy copyRegion{};
+                copyRegion.size = posEncBufferSize;
+                vkCmdCopyBuffer(cmd, pStagingBuffer->getBuffer(), mpPositionalEncodingBuffer->getBuffer(), 1,
+                                &copyRegion);
+            });
+            Log::Info("Uploaded positional encoding buffer to GPU: {} bytes", posEncBufferSize);
+        }
 
         // Palette Buffer
         if (!mNeuralModelData.palette.values.empty()) {
@@ -1077,6 +1126,8 @@ ptr<Layout> Scene::getLayout()
     desc.emplace_back(3, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT);
     // 3.2: Neural VQ Codebook Buffer (SSBO)
     desc.emplace_back(3, 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT);
+    // 3.3: Neural Positional Encoding Buffer (SSBO) // <<< ADD THIS LINE
+    desc.emplace_back(3, 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT);
 
     if (mSupportRayTracing) {
         // 4.0: Acceleration structure
@@ -1240,6 +1291,12 @@ void Scene::createDescriptors()
     // --- Binding 2: Neural VQ Codebook ---
     if (mHasNeuralModel && mpVQCodebookBuffer) {
         globalDesc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, mpVQCodebookBuffer);
+    } else {
+        globalDesc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, mpDummyStorageBuffer);
+    }
+    // --- Binding 3: Neural Positional Encoding --- // <<< ADD THIS BLOCK
+    if (mHasNeuralModel && mpPositionalEncodingBuffer) {
+        globalDesc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, mpPositionalEncodingBuffer);
     } else {
         globalDesc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, mpDummyStorageBuffer);
     }

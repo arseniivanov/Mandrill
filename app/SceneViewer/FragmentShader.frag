@@ -95,10 +95,14 @@ layout(set = 2, binding = 27) readonly buffer MlpL2_B_Buffer { float data[]; } m
 layout(set = 3, binding = 0) uniform sampler2D environmentMap;
 layout(set = 3, binding = 1) readonly buffer PaletteBuffer  { float data[]; } paletteBuffer;
 layout(set = 3, binding = 2) readonly buffer VQCodebookBuffer { uint data[]; } vqCodebookBuffer;
+layout(set = 3, binding = 3) readonly buffer PositionalEncodingBuffer { float data[]; } posEncodingBuffer;
 
 // =========================================================================
 // NEURAL TEXTURING HELPER FUNCTIONS
 // =========================================================================
+
+const int POS_ENCODING_TABLE_SIZE = 8;
+const int POS_ENCODING_FEATURES_PER_DIM = 5; // 3 octaves * 2 offsets - 1 skipped
 
 uint unpack_2bit_value(uint byte, uint index_in_byte) {
     return (byte >> (index_in_byte * 2)) & 0x03u;
@@ -119,27 +123,29 @@ float get_feature_from_codebook(uint vq_index, uint feature_index) {
     return paletteBuffer.data[palette_index];
 }
 
-// Triangular wave function from positional_encoding.py. Correct.
-float tri(float x, float offset) {
-    return (2.0 * abs(mod(x - offset, 2.0) - 1.0) - 1.0);
-}
-
-// Appends positional encoding features. Correct.
 void append_positional_encoding(inout float features[128], inout int feature_count, vec2 coords) {
-    float x = coords.x * 8;
-    float y = coords.y * 8;
+    // Determine integer indices [0, 7] from fractional coordinates [0, 1)
+    int ix = clamp(int(coords.x * float(POS_ENCODING_TABLE_SIZE)), 0, POS_ENCODING_TABLE_SIZE - 1);
+    int iy = clamp(int(coords.y * float(POS_ENCODING_TABLE_SIZE)), 0, POS_ENCODING_TABLE_SIZE - 1);
 
+    // Calculate the starting offset into the buffer for our x and y table entries
+    int base_idx_x = ix * POS_ENCODING_FEATURES_PER_DIM;
+    int base_idx_y = iy * POS_ENCODING_FEATURES_PER_DIM;
+
+    int feature_offset = 0;
+    // This loop structure exactly mimics the original's calculation and interleaving order
     for (uint octave = 0; octave < 3; ++octave) {
-        float div = float(1 << octave);
         for (int i = 0; i < 2; ++i) {
-            float offset = (i == 0) ? 0.5 : 0.0;
             if (octave == 0 && i == 0) continue;
-            
-            features[feature_count++] = tri(x / div, offset);
-            features[feature_count++] = tri(y / div, offset);
+
+            // Look up pre-calculated values instead of computing them
+            features[feature_count++] = posEncodingBuffer.data[base_idx_x + feature_offset];
+            features[feature_count++] = posEncodingBuffer.data[base_idx_y + feature_offset];
+            feature_offset++;
         }
     }
-    features[feature_count++] = 0.0;
+
+    // The final single zero is not from the buffer, so we still append it manually.
     features[feature_count++] = 0.0;
 }
 
@@ -280,8 +286,14 @@ vec4 evaluate_neural_texture(vec2 uv, float lod) {
             float interp_x2 = mix(v2, v3, current_frac_coords.x);
             features[feature_count++] = mix(interp_x1, interp_x2, current_frac_coords.y);
         }
+    }
+
+    // --- 4. Append Positional Encoding & LOD ---
+    if(num_selections_g0 > 0 || num_selections_g1 > 0){
+        append_positional_encoding(features, feature_count, frac_coords);
         return vec4(0.0,1.0,0.0,1.0); // Green working color
     }
+    features[feature_count++] = lod;
 
     return vec4(1.0, 0.0, 1.0, 1.0); // Magenta error color
 }
