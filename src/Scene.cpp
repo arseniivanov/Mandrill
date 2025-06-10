@@ -5,8 +5,10 @@
 #include "Log.h"
 #include "Pipeline.h"
 
+#include "glm/fwd.hpp"
 #include "tiny_obj_loader.h"
 #include <complex>
+#include <cstdint>
 
 using namespace Mandrill;
 
@@ -740,7 +742,7 @@ void Scene::compile()
                         const ChannelSelections& selections = it->second;
 
                         // Grid 0
-                        mat.params.channelCounts[l][0] = selections.grid0_selected_channels.size();
+                        mat.params.channelCounts[l].x = uint32_t(selections.grid0_selected_channels.size());
                         if (!selections.grid0_selected_channels.empty()) {
                             VkDeviceSize bufferSize = sizeof(uint16_t) * selections.grid0_selected_channels.size();
                             ptr<Buffer> pGpuBuffer =
@@ -762,7 +764,7 @@ void Scene::compile()
                         }
 
                         // Grid 1
-                        mat.params.channelCounts[l][1] = selections.grid1_selected_channels.size();
+                        mat.params.channelCounts[l].y = uint32_t(selections.grid1_selected_channels.size());
                         if (!selections.grid1_selected_channels.empty()) {
                             VkDeviceSize bufferSize = sizeof(uint16_t) * selections.grid1_selected_channels.size();
                             ptr<Buffer> pGpuBuffer =
@@ -782,10 +784,11 @@ void Scene::compile()
                             Log::Debug("Uploaded channel selection for '{}' L{}G1: {} indices", mat.name, l,
                                        selections.grid1_selected_channels.size());
                         }
+                        mat.params.channelCounts[l].z = 0.0;
+                        mat.params.channelCounts[l].w = 0.0;
                     } else {
                         // No selections for this level
-                        mat.params.channelCounts[l][0] = 0;
-                        mat.params.channelCounts[l][1] = 0;
+                        mat.params.channelCounts[l] = glm::uvec4(0);
                     }
                 }
 
@@ -896,15 +899,22 @@ void Scene::compile()
         mNodes[i].mpTransformDevice = transforms_ptr + i * copies;
     }
 
-    // Associate materials with the material params buffer and copy final data
-    MaterialParams* materialParams_ptr = static_cast<MaterialParams*>(mpMaterialParams->getHostMap());
-    for (uint32_t i = 0; i < count(mMaterials); i++) {
-        mMaterials[i].paramsDevice = materialParams_ptr + i;
-        mMaterials[i].paramsOffset =
-            i * Helpers::alignTo(sizeof(MaterialParams), alignment); // Note: Offset calculation was slightly off before
 
-        // This is now the final update after neural processing has modified mat.params
-        *(mMaterials[i].paramsDevice) = mMaterials[i].params;
+    VkDeviceSize alignedSize = Helpers::alignTo(sizeof(MaterialParams), alignment);
+
+    // Get a raw byte pointer to the start of the mapped buffer
+    uint8_t* base_ptr = static_cast<uint8_t*>(mpMaterialParams->getHostMap());
+
+    // Loop and copy to the CORRECT, ALIGNED locations
+    for (uint32_t i = 0; i < mMaterials.size(); i++) {
+        // Calculate the correct byte offset for the current material
+        VkDeviceSize currentOffset = i * alignedSize;
+
+        // Get the destination pointer by adding the byte offset to the base pointer
+        MaterialParams* dest_ptr = reinterpret_cast<MaterialParams*>(base_ptr + currentOffset);
+
+        // Now copy the data to the correct, calculated destination
+        *dest_ptr = mMaterials[i].params;
     }
 
     // Create dummy buffer for unused descriptor slots
@@ -1129,14 +1139,17 @@ void Scene::createDescriptors()
     // =========================================================================
     // This is the most complex part. Each material gets its own descriptor set
     // which holds all of its parameters, textures, and neural data buffers.
-    for (auto& mat : mMaterials) {
+    VkDeviceSize alignment = mpDevice->getProperties().physicalDevice.limits.minUniformBufferOffsetAlignment;
+    VkDeviceSize alignedSize = Helpers::alignTo(sizeof(MaterialParams), alignment);
+    for (uint32_t i = 0; i < mMaterials.size(); ++i) {
+        auto& mat = mMaterials[i];
         std::vector<DescriptorDesc> desc; // Start a new list of bindings for this material.
 
         // --- Binding 0: Material UBO ---
         // Point to the shared UBO buffer for all material parameters.
         desc.emplace_back(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, mpMaterialParams);
         // Specify that this material's data is at a specific offset within that large buffer.
-        desc.back().offset = mat.paramsOffset;
+        desc.back().offset = i * alignedSize;
         desc.back().range = sizeof(MaterialParams);
 
         // --- Bindings 1-5: Standard Textures ---

@@ -47,9 +47,7 @@ layout(set = 2, binding = 0) uniform MaterialParamsUBO {
     float pad0;
     float pad1;
     float pad2;
-
-    uint channelCounts[MAX_NEURAL_FEATURE_GRID_LEVELS][2];
-    float pad3;
+    uvec4 channelCounts[MAX_NEURAL_FEATURE_GRID_LEVELS];
     uvec4 featureGridShapes[MAX_NEURAL_FEATURE_GRID_LEVELS][2];
 } materialParams;
 
@@ -158,7 +156,8 @@ vec4 evaluate_neural_texture(vec2 uv, float lod) {
     
     vec2 frac_coords;
 
-    uint num_selections_g0 = materialParams.channelCounts[level_idx][0];
+    // --- 2. Grid 0 Feature Gathering (4 scaled features per channel) ---
+    uint num_selections_g0 = materialParams.channelCounts[level_idx].x;
     if (num_selections_g0 > 0) {
         uvec3 grid_dims = materialParams.featureGridShapes[level_idx][0].xyz;
         vec2 grid_coords = uv * vec2(grid_dims.z, grid_dims.y);
@@ -181,7 +180,6 @@ vec4 evaluate_neural_texture(vec2 uv, float lod) {
                 case 3: channel_to_sample = uint(grid0l3_channels.indices[i]); vq_index = uint(texelFetch(neuralVQGridL3G0, ivec3(fetch_coord_int, channel_to_sample), 0).r); break;
             }
 
-            // *** CRITICAL FIX: Simplified and Corrected Patch Coordinate Logic ***
             vec2 patch_coords = frac_coords * 4.0;
             ivec2 patch_base_int = ivec2(floor(patch_coords));
 
@@ -200,7 +198,88 @@ vec4 evaluate_neural_texture(vec2 uv, float lod) {
             features[feature_count++] = f01 * w01;
             features[feature_count++] = f11 * w11;
         }
+    }
 
+    uint num_selections_g1 = materialParams.channelCounts[level_idx].y;
+    if (num_selections_g1 > 0) {
+        uvec3 grid_dims = materialParams.featureGridShapes[level_idx][1].xyz;
+        vec2 grid_coords = uv * vec2(grid_dims.z, grid_dims.y);
+        ivec2 base_coords_int = ivec2(floor(grid_coords - 0.5));
+        vec2 current_frac_coords = fract(grid_coords - 0.5);
+
+        if (num_selections_g0 == 0) {
+            frac_coords = current_frac_coords;
+        }
+
+        for (int i = 0; i < num_selections_g1; ++i) {
+            uint channel_to_sample;
+            uint vq_idx_00, vq_idx_10, vq_idx_01, vq_idx_11;
+
+            ivec2 n00 = (base_coords_int + ivec2(0,0)) % ivec2(grid_dims.z, grid_dims.y);
+            ivec2 n10 = (base_coords_int + ivec2(1,0)) % ivec2(grid_dims.z, grid_dims.y);
+            ivec2 n01 = (base_coords_int + ivec2(0,1)) % ivec2(grid_dims.z, grid_dims.y);
+            ivec2 n11 = (base_coords_int + ivec2(1,1)) % ivec2(grid_dims.z, grid_dims.y);
+
+            switch(level_idx) {
+                case 0:
+                    channel_to_sample = uint(grid1l0_channels.indices[i]);
+                    vq_idx_00 = uint(texelFetch(neuralVQGridL0G1, ivec3(n00, channel_to_sample), 0).r);
+                    vq_idx_10 = uint(texelFetch(neuralVQGridL0G1, ivec3(n10, channel_to_sample), 0).r);
+                    vq_idx_01 = uint(texelFetch(neuralVQGridL0G1, ivec3(n01, channel_to_sample), 0).r);
+                    vq_idx_11 = uint(texelFetch(neuralVQGridL0G1, ivec3(n11, channel_to_sample), 0).r);
+                    break;
+                case 1:
+                    channel_to_sample = uint(grid1l1_channels.indices[i]);
+                    vq_idx_00 = uint(texelFetch(neuralVQGridL1G1, ivec3(n00, channel_to_sample), 0).r);
+                    vq_idx_10 = uint(texelFetch(neuralVQGridL1G1, ivec3(n10, channel_to_sample), 0).r);
+                    vq_idx_01 = uint(texelFetch(neuralVQGridL1G1, ivec3(n01, channel_to_sample), 0).r);
+                    vq_idx_11 = uint(texelFetch(neuralVQGridL1G1, ivec3(n11, channel_to_sample), 0).r);
+                    break;
+                case 2:
+                    channel_to_sample = uint(grid1l2_channels.indices[i]);
+                    vq_idx_00 = uint(texelFetch(neuralVQGridL2G1, ivec3(n00, channel_to_sample), 0).r);
+                    vq_idx_10 = uint(texelFetch(neuralVQGridL2G1, ivec3(n10, channel_to_sample), 0).r);
+                    vq_idx_01 = uint(texelFetch(neuralVQGridL2G1, ivec3(n01, channel_to_sample), 0).r);
+                    vq_idx_11 = uint(texelFetch(neuralVQGridL2G1, ivec3(n11, channel_to_sample), 0).r);
+                    break;
+                case 3:
+                    channel_to_sample = uint(grid1l3_channels.indices[i]);
+                    vq_idx_00 = uint(texelFetch(neuralVQGridL3G1, ivec3(n00, channel_to_sample), 0).r);
+                    vq_idx_10 = uint(texelFetch(neuralVQGridL3G1, ivec3(n10, channel_to_sample), 0).r);
+                    vq_idx_01 = uint(texelFetch(neuralVQGridL3G1, ivec3(n01, channel_to_sample), 0).r);
+                    vq_idx_11 = uint(texelFetch(neuralVQGridL3G1, ivec3(n11, channel_to_sample), 0).r);
+                    break;
+            }
+            
+            vec2 patch_coords = current_frac_coords * 4.0;
+            ivec2 patch_base_int = ivec2(floor(patch_coords));
+            vec2 patch_frac = fract(patch_coords);
+
+            uint p_idx00 = uint(clamp(patch_base_int.y,     0, 3)) * 4 + uint(clamp(patch_base_int.x,     0, 3));
+            uint p_idx10 = uint(clamp(patch_base_int.y,     0, 3)) * 4 + uint(clamp(patch_base_int.x + 1, 0, 3));
+            uint p_idx01 = uint(clamp(patch_base_int.y + 1, 0, 3)) * 4 + uint(clamp(patch_base_int.x,     0, 3));
+            uint p_idx11 = uint(clamp(patch_base_int.y + 1, 0, 3)) * 4 + uint(clamp(patch_base_int.x + 1, 0, 3));
+
+            float feat_00 = mix(get_feature_from_codebook(vq_idx_00, p_idx00), get_feature_from_codebook(vq_idx_00, p_idx10), patch_frac.x);
+            float feat_01 = mix(get_feature_from_codebook(vq_idx_00, p_idx01), get_feature_from_codebook(vq_idx_00, p_idx11), patch_frac.x);
+            float v0 = mix(feat_00, feat_01, patch_frac.y);
+
+            float feat_10 = mix(get_feature_from_codebook(vq_idx_10, p_idx00), get_feature_from_codebook(vq_idx_10, p_idx10), patch_frac.x);
+            float feat_11 = mix(get_feature_from_codebook(vq_idx_10, p_idx01), get_feature_from_codebook(vq_idx_10, p_idx11), patch_frac.x);
+            float v1 = mix(feat_10, feat_11, patch_frac.y);
+            
+            float feat_20 = mix(get_feature_from_codebook(vq_idx_01, p_idx00), get_feature_from_codebook(vq_idx_01, p_idx10), patch_frac.x);
+            float feat_21 = mix(get_feature_from_codebook(vq_idx_01, p_idx01), get_feature_from_codebook(vq_idx_01, p_idx11), patch_frac.x);
+            float v2 = mix(feat_20, feat_21, patch_frac.y);
+            
+            float feat_30 = mix(get_feature_from_codebook(vq_idx_11, p_idx00), get_feature_from_codebook(vq_idx_11, p_idx10), patch_frac.x);
+            float feat_31 = mix(get_feature_from_codebook(vq_idx_11, p_idx01), get_feature_from_codebook(vq_idx_11, p_idx11), patch_frac.x);
+            float v3 = mix(feat_30, feat_31, patch_frac.y);
+            
+            float interp_x1 = mix(v0, v1, current_frac_coords.x);
+            float interp_x2 = mix(v2, v3, current_frac_coords.x);
+            features[feature_count++] = mix(interp_x1, interp_x2, current_frac_coords.y);
+        }
         return vec4(0.0,1.0,0.0,1.0); // Green working color
     }
 

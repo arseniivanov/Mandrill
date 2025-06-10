@@ -69,9 +69,7 @@ namespace Mandrill
         float pad1;
         float pad2;
 
-        uint32_t channelCounts[MAX_NEURAL_FEATURE_GRID_LEVELS][2];
-        float pad3;
-
+        glm::uvec4 channelCounts[MAX_NEURAL_FEATURE_GRID_LEVELS];
         glm::uvec4 featureGridShapes[MAX_NEURAL_FEATURE_GRID_LEVELS][2];
     };
 
@@ -86,8 +84,6 @@ namespace Mandrill
 
     struct Material {
         MaterialParams params{};
-        MaterialParams* paramsDevice{}; // This is set during Scene::compile()
-        VkDeviceSize paramsOffset{};    // This is set during Scene::compile()
 
         std::string diffuseTexturePath;
         std::string specularTexturePath;
