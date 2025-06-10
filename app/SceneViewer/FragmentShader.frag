@@ -123,30 +123,35 @@ float get_feature_from_codebook(uint vq_index, uint feature_index) {
     return paletteBuffer.data[palette_index];
 }
 
-void append_positional_encoding(inout float features[128], inout int feature_count, vec2 coords) {
+void append_positional_encoding_static(inout float features[128], int base_feature_index, vec2 coords) {
     // Determine integer indices [0, 7] from fractional coordinates [0, 1)
     int ix = clamp(int(coords.x * float(POS_ENCODING_TABLE_SIZE)), 0, POS_ENCODING_TABLE_SIZE - 1);
     int iy = clamp(int(coords.y * float(POS_ENCODING_TABLE_SIZE)), 0, POS_ENCODING_TABLE_SIZE - 1);
 
     // Calculate the starting offset into the buffer for our x and y table entries
-    int base_idx_x = ix * POS_ENCODING_FEATURES_PER_DIM;
-    int base_idx_y = iy * POS_ENCODING_FEATURES_PER_DIM;
+    int base_lookup_idx_x = ix * POS_ENCODING_FEATURES_PER_DIM;
+    int base_lookup_idx_y = iy * POS_ENCODING_FEATURES_PER_DIM;
 
-    int feature_offset = 0;
-    // This loop structure exactly mimics the original's calculation and interleaving order
-    for (uint octave = 0; octave < 3; ++octave) {
-        for (int i = 0; i < 2; ++i) {
-            if (octave == 0 && i == 0) continue;
+    // Manually unroll all 11 feature appends.
+    // The compiler can optimize these static-indexed writes much better.
+    // Octave 0, Offset 0.0 (skipped for x)
+    features[base_feature_index + 0]  = posEncodingBuffer.data[base_lookup_idx_x + 0]; // Corresponds to octave 0, offset 0.0
+    features[base_feature_index + 1]  = posEncodingBuffer.data[base_lookup_idx_y + 0];
 
-            // Look up pre-calculated values instead of computing them
-            features[feature_count++] = posEncodingBuffer.data[base_idx_x + feature_offset];
-            features[feature_count++] = posEncodingBuffer.data[base_idx_y + feature_offset];
-            feature_offset++;
-        }
-    }
+    // Octave 1
+    features[base_feature_index + 2]  = posEncodingBuffer.data[base_lookup_idx_x + 1]; // Corresponds to octave 1, offset 0.5
+    features[base_feature_index + 3]  = posEncodingBuffer.data[base_lookup_idx_y + 1];
+    features[base_feature_index + 4]  = posEncodingBuffer.data[base_lookup_idx_x + 2]; // Corresponds to octave 1, offset 0.0
+    features[base_feature_index + 5]  = posEncodingBuffer.data[base_lookup_idx_y + 2];
 
-    // The final single zero is not from the buffer, so we still append it manually.
-    features[feature_count++] = 0.0;
+    // Octave 2
+    features[base_feature_index + 6]  = posEncodingBuffer.data[base_lookup_idx_x + 3]; // Corresponds to octave 2, offset 0.5
+    features[base_feature_index + 7]  = posEncodingBuffer.data[base_lookup_idx_y + 3];
+    features[base_feature_index + 8]  = posEncodingBuffer.data[base_lookup_idx_x + 4]; // Corresponds to octave 2, offset 0.0
+    features[base_feature_index + 9]  = posEncodingBuffer.data[base_lookup_idx_y + 4];
+
+    // Final zero
+    features[base_feature_index + 10] = 0.0;
 }
 
 vec4 evaluate_neural_texture(vec2 uv, float lod) {
@@ -290,7 +295,8 @@ vec4 evaluate_neural_texture(vec2 uv, float lod) {
 
     // --- 4. Append Positional Encoding & LOD ---
     if(num_selections_g0 > 0 || num_selections_g1 > 0){
-        append_positional_encoding(features, feature_count, frac_coords);
+        append_positional_encoding_static(features, feature_count, frac_coords);
+        feature_count += 11;
         return vec4(0.0,1.0,0.0,1.0); // Green working color
     }
     features[feature_count++] = lod;
