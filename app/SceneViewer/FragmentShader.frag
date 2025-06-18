@@ -156,6 +156,21 @@ void append_positional_encoding_static(inout float features[128], int base_featu
     features[base_feature_index + 10] = 0.0;
 }
 
+float interpolate_vq_patch(uint vq_idx, uint p_idx00, uint p_idx10, uint p_idx01, uint p_idx11, vec2 frac_coords_patch) {
+    // Fetch the four neighboring feature values from the VQ codebook
+    float feat_p00 = get_feature_from_codebook(vq_idx, p_idx00); // Top-left sub-feature
+    float feat_p10 = get_feature_from_codebook(vq_idx, p_idx10); // Top-right sub-feature
+    float feat_p01 = get_feature_from_codebook(vq_idx, p_idx01); // Bottom-left sub-feature
+    float feat_p11 = get_feature_from_codebook(vq_idx, p_idx11); // Bottom-right sub-feature
+
+    // First, interpolate along the X-axis
+    float interp_x1 = mix(feat_p00, feat_p10, frac_coords_patch.x);
+    float interp_x2 = mix(feat_p01, feat_p11, frac_coords_patch.x);
+
+    // Then, interpolate the results along the Y-axis
+    return mix(interp_x1, interp_x2, frac_coords_patch.y);
+}
+
 vec4 evaluate_neural_texture(vec2 uv, float lod) {
     int level_idx = 0;
     if (lod < 4.0) level_idx = 0;
@@ -173,7 +188,8 @@ vec4 evaluate_neural_texture(vec2 uv, float lod) {
     uint num_selections_g0 = materialParams.channelCounts[level_idx].x;
     if (num_selections_g0 > 0) {
         uvec3 grid_dims = materialParams.featureGridShapes[level_idx][0].xyz;
-        vec2 grid_coords = uv * vec2(grid_dims.z, grid_dims.y);
+        vec2 rotated_uv = -vec2(uv.y, uv.x);
+        vec2 grid_coords = rotated_uv * vec2(grid_dims.z, grid_dims.y);
         ivec2 base_coords_int = ivec2(floor(grid_coords));
         frac_coords = fract(grid_coords);
 
@@ -235,13 +251,13 @@ vec4 evaluate_neural_texture(vec2 uv, float lod) {
             }
 
             float f00 = get_feature_from_codebook(vq_idx_00, idx00);
-            float f10 = get_feature_from_codebook(vq_idx_10, idx01);
-            float f01 = get_feature_from_codebook(vq_idx_01, idx10);
+            float f01 = get_feature_from_codebook(vq_idx_01, idx01);
+            float f10 = get_feature_from_codebook(vq_idx_10, idx10);
             float f11 = get_feature_from_codebook(vq_idx_11, idx11);
 
             features[feature_count++] = f00 * w00;
-            features[feature_count++] = f10 * w10;
             features[feature_count++] = f01 * w01;
+            features[feature_count++] = f10 * w10;
             features[feature_count++] = f11 * w11;
         }
     }
@@ -249,7 +265,8 @@ vec4 evaluate_neural_texture(vec2 uv, float lod) {
     uint num_selections_g1 = materialParams.channelCounts[level_idx].y;
     if (num_selections_g1 > 0) {
         uvec3 grid_dims = materialParams.featureGridShapes[level_idx][1].xyz;
-        vec2 grid_coords = uv * vec2(grid_dims.z, grid_dims.y);
+        vec2 rotated_uv = -vec2(uv.y, uv.x);
+        vec2 grid_coords = rotated_uv * vec2(grid_dims.z, grid_dims.y);
         ivec2 base_coords_int = ivec2(floor(grid_coords));
         vec2 frac_coords = fract(grid_coords);
 
@@ -306,13 +323,16 @@ vec4 evaluate_neural_texture(vec2 uv, float lod) {
                     break;
             }
 
-            float f00 = get_feature_from_codebook(vq_idx_00, p_idx00);
-            float f10 = get_feature_from_codebook(vq_idx_10, p_idx01);
-            float f01 = get_feature_from_codebook(vq_idx_01, p_idx10);
-            float f11 = get_feature_from_codebook(vq_idx_11, p_idx11);
-            float interp_val = f00 * w00 + f10 * w10 + f01 * w01 + f11 * w11;
+            float v00 = interpolate_vq_patch(vq_idx_00, p_idx00, p_idx10, p_idx01, p_idx11, patch_frac);
+            float v10 = interpolate_vq_patch(vq_idx_10, p_idx00, p_idx10, p_idx01, p_idx11, patch_frac);
+            float v01 = interpolate_vq_patch(vq_idx_01, p_idx00, p_idx10, p_idx01, p_idx11, patch_frac);
+            float v11 = interpolate_vq_patch(vq_idx_11, p_idx00, p_idx10, p_idx01, p_idx11, patch_frac);
 
-            features[feature_count++] = interp_val;
+            float interp_x1 = mix(v00, v10, frac_coords.x);
+            float interp_x2 = mix(v01, v11, frac_coords.x);
+            float final_feature = mix(interp_x1, interp_x2, frac_coords.y);
+
+            features[feature_count++] = final_feature;
         }
     }
     //TODO insert padding with 0s between last feature and the positional encoding for different LODS
