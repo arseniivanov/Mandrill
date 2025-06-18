@@ -71,6 +71,7 @@ namespace Mandrill
 
         glm::uvec4 channelCounts[MAX_NEURAL_FEATURE_GRID_LEVELS];
         glm::uvec4 featureGridShapes[MAX_NEURAL_FEATURE_GRID_LEVELS][2];
+        glm::uvec4 mlpLayerShapes[MAX_MLP_LAYERS]; // .x=in, .y=out
     };
 
     struct alignas(16) MaterialDevice {

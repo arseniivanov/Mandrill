@@ -732,7 +732,7 @@ void Scene::compile()
 
                                     // Create the flattened 2D texture
                                     ptr<Texture> pGridTexture =
-                                        make_ptr<Texture>(mpDevice, Texture::Type::Texture2D, VK_FORMAT_R8_UINT,
+                                        make_ptr<Texture>(mpDevice, Texture::Type::Texture2DArray, VK_FORMAT_R8_UINT,
                                                           fgd.data_uint8.data(), width, height, channels, 1, false);
 
                                     if (m_pLastSetSamplerInScene) {
@@ -849,6 +849,12 @@ void Scene::compile()
                 for (const MLPLayer& sm_layer : specific_mat_data.mlp_layers) {
                     if (mat.mlpWeightBuffers.size() >= MAX_MLP_LAYERS)
                         break; // Adhere to layout limit
+
+                    if (!sm_layer.weights_shape.empty()) {
+                        // Assuming weights_shape is [out_channels, in_channels, 1, 1]
+                        mat.params.mlpLayerShapes[sm_layer.layer_idx].x = sm_layer.weights_shape[1];
+                        mat.params.mlpLayerShapes[sm_layer.layer_idx].y = sm_layer.weights_shape[0];
+                    }
 
                     // Weights
                     if (!sm_layer.weights_raw_bytes.empty()) {

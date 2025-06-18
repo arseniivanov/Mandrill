@@ -13,6 +13,7 @@ layout(location = 0) out vec4 fragColor;
 // --- Constants ---
 #define MAX_NEURAL_FEATURE_GRID_LEVELS 4
 #define MAX_MLP_LAYERS 3
+#define RESOLUTION 1024
 
 const uint DIFFUSE_TEXTURE_BIT  = 1 << 0;
 const uint SPECULAR_TEXTURE_BIT = 1 << 1;
@@ -49,6 +50,7 @@ layout(set = 2, binding = 0) uniform MaterialParamsUBO {
     float pad2;
     uvec4 channelCounts[MAX_NEURAL_FEATURE_GRID_LEVELS];
     uvec4 featureGridShapes[MAX_NEURAL_FEATURE_GRID_LEVELS][2];
+    uvec4 mlpLayerShapes[MAX_MLP_LAYERS];
 } materialParams;
 
 // Standard Textures (bindings 1-5)
@@ -60,14 +62,14 @@ layout(set = 2, binding = 5) uniform sampler2D normalTexture;
 
 // --- Neural VQ Grids (bindings 6-13) ---
 // These are now texture handles for use with `texelFetch`
-layout(set = 2, binding = 6) uniform texture2DArray neuralVQGridL0G0;
-layout(set = 2, binding = 7) uniform texture2DArray  neuralVQGridL0G1;
-layout(set = 2, binding = 8) uniform texture2DArray  neuralVQGridL1G0;
-layout(set = 2, binding = 9) uniform texture2DArray  neuralVQGridL1G1;
-layout(set = 2, binding = 10) uniform texture2DArray  neuralVQGridL2G0;
-layout(set = 2, binding = 11) uniform texture2DArray  neuralVQGridL2G1;
-layout(set = 2, binding = 12) uniform texture2DArray  neuralVQGridL3G0;
-layout(set = 2, binding = 13) uniform texture2DArray  neuralVQGridL3G1;
+layout(set = 2, binding = 6) uniform usampler2DArray neuralVQGridL0G0;
+layout(set = 2, binding = 7) uniform usampler2DArray neuralVQGridL0G1;
+layout(set = 2, binding = 8) uniform usampler2DArray neuralVQGridL1G0;
+layout(set = 2, binding = 9) uniform usampler2DArray neuralVQGridL1G1;
+layout(set = 2, binding = 10) uniform usampler2DArray neuralVQGridL2G0;
+layout(set = 2, binding = 11) uniform usampler2DArray neuralVQGridL2G1;
+layout(set = 2, binding = 12) uniform usampler2DArray neuralVQGridL3G0;
+layout(set = 2, binding = 13) uniform usampler2DArray neuralVQGridL3G1;
 
 // --- Neural Channel Selection SSBOs (bindings 14-21) ---
 layout(set = 2, binding = 14) readonly buffer Grid0L0_Channels { uint16_t indices[]; } grid0l0_channels;
@@ -81,12 +83,12 @@ layout(set = 2, binding = 21) readonly buffer Grid1L3_Channels { uint16_t indice
 
 // --- Neural MLP Layer SSBOs (bindings 22+) ---
 // Using arrays of SSBOs would be ideal but is not core GLSL. We declare them individually.
-layout(set = 2, binding = 22) readonly buffer MlpL0_W_Buffer { float data[]; } mlpL0_W;
-layout(set = 2, binding = 23) readonly buffer MlpL0_B_Buffer { float data[]; } mlpL0_B;
-layout(set = 2, binding = 24) readonly buffer MlpL1_W_Buffer { float data[]; } mlpL1_W;
-layout(set = 2, binding = 25) readonly buffer MlpL1_B_Buffer { float data[]; } mlpL1_B;
-layout(set = 2, binding = 26) readonly buffer MlpL2_W_Buffer { float data[]; } mlpL2_W;
-layout(set = 2, binding = 27) readonly buffer MlpL2_B_Buffer { float data[]; } mlpL2_B;
+layout(set = 2, binding = 22) readonly buffer MlpL0_W_Buffer { float16_t data[]; } mlpL0_W;
+layout(set = 2, binding = 23) readonly buffer MlpL0_B_Buffer { float16_t data[]; } mlpL0_B;
+layout(set = 2, binding = 24) readonly buffer MlpL1_W_Buffer { float16_t data[]; } mlpL1_W;
+layout(set = 2, binding = 25) readonly buffer MlpL1_B_Buffer { float16_t data[]; } mlpL1_B;
+layout(set = 2, binding = 26) readonly buffer MlpL2_W_Buffer { float16_t data[]; } mlpL2_W;
+layout(set = 2, binding = 27) readonly buffer MlpL2_B_Buffer { float16_t data[]; } mlpL2_B;
 
 
 // =========================================================================
@@ -124,9 +126,9 @@ float get_feature_from_codebook(uint vq_index, uint feature_index) {
 }
 
 void append_positional_encoding_static(inout float features[128], int base_feature_index, vec2 coords) {
-    // Determine integer indices [0, 7] from fractional coordinates [0, 1)
-    int ix = clamp(int(coords.x * float(POS_ENCODING_TABLE_SIZE)), 0, POS_ENCODING_TABLE_SIZE - 1);
-    int iy = clamp(int(coords.y * float(POS_ENCODING_TABLE_SIZE)), 0, POS_ENCODING_TABLE_SIZE - 1);
+    ivec2 int_coords = ivec2(coords);
+    int ix = int_coords.x % POS_ENCODING_TABLE_SIZE;
+    int iy = int_coords.y % POS_ENCODING_TABLE_SIZE;
 
     // Calculate the starting offset into the buffer for our x and y table entries
     int base_lookup_idx_x = ix * POS_ENCODING_FEATURES_PER_DIM;
@@ -172,37 +174,70 @@ vec4 evaluate_neural_texture(vec2 uv, float lod) {
     if (num_selections_g0 > 0) {
         uvec3 grid_dims = materialParams.featureGridShapes[level_idx][0].xyz;
         vec2 grid_coords = uv * vec2(grid_dims.z, grid_dims.y);
-        ivec2 base_coords_int = ivec2(floor(grid_coords - 0.5));
-        frac_coords = fract(grid_coords - 0.5);
+        ivec2 base_coords_int = ivec2(floor(grid_coords));
+        frac_coords = fract(grid_coords);
 
         float w11 = frac_coords.x * frac_coords.y;
         float w10 = frac_coords.x * (1.0 - frac_coords.y);
         float w01 = (1.0 - frac_coords.x) * frac_coords.y;
         float w00 = (1.0 - frac_coords.x) * (1.0 - frac_coords.y);
+        
+        ivec2 fetch_coord_int = ivec2(int(grid_coords.x), int(grid_coords.y)) % ivec2(grid_dims.z, grid_dims.y);
+
+        vec2 patch_coords = frac_coords * 4.0;
+        ivec2 patch_base_int = ivec2(floor(patch_coords));
+        uint idx00 = uint(clamp(patch_base_int.y,     0, 3)) * 4 + uint(clamp(patch_base_int.x,     0, 3));
+        uint idx01 = uint(clamp(patch_base_int.y,     0, 3)) * 4 + uint(clamp(patch_base_int.x + 1, 0, 3));
+        uint idx10 = uint(clamp(patch_base_int.y + 1, 0, 3)) * 4 + uint(clamp(patch_base_int.x,     0, 3));
+        uint idx11 = uint(clamp(patch_base_int.y + 1, 0, 3)) * 4 + uint(clamp(patch_base_int.x + 1, 0, 3));
+
+        ivec2 n00 = (base_coords_int + ivec2(0,0)) % ivec2(grid_dims.z, grid_dims.y);
+        ivec2 n10 = (base_coords_int + ivec2(1,0)) % ivec2(grid_dims.z, grid_dims.y);
+        ivec2 n01 = (base_coords_int + ivec2(0,1)) % ivec2(grid_dims.z, grid_dims.y);
+        ivec2 n11 = (base_coords_int + ivec2(1,1)) % ivec2(grid_dims.z, grid_dims.y);
+
+        uint vq_idx_00; 
+        uint vq_idx_10; 
+        uint vq_idx_01; 
+        uint vq_idx_11; 
 
         for (int i = 0; i < num_selections_g0; ++i) {
             uint channel_to_sample;
-            uint vq_index; 
-            ivec2 fetch_coord_int = ivec2(int(grid_coords.x), int(grid_coords.y)) % ivec2(grid_dims.z, grid_dims.y);
             switch(level_idx) {
-                case 0: channel_to_sample = uint(grid0l0_channels.indices[i]); vq_index = uint(texelFetch(neuralVQGridL0G0, ivec3(fetch_coord_int, channel_to_sample), 0).r); break;
-                case 1: channel_to_sample = uint(grid0l1_channels.indices[i]); vq_index = uint(texelFetch(neuralVQGridL1G0, ivec3(fetch_coord_int, channel_to_sample), 0).r); break;
-                case 2: channel_to_sample = uint(grid0l2_channels.indices[i]); vq_index = uint(texelFetch(neuralVQGridL2G0, ivec3(fetch_coord_int, channel_to_sample), 0).r); break;
-                case 3: channel_to_sample = uint(grid0l3_channels.indices[i]); vq_index = uint(texelFetch(neuralVQGridL3G0, ivec3(fetch_coord_int, channel_to_sample), 0).r); break;
+                case 0:
+                    channel_to_sample = uint(grid0l0_channels.indices[i]);
+                    vq_idx_00 = uint(texelFetch(neuralVQGridL0G0, ivec3(n00, channel_to_sample), 0).r);
+                    vq_idx_10 = uint(texelFetch(neuralVQGridL0G0, ivec3(n10, channel_to_sample), 0).r);
+                    vq_idx_01 = uint(texelFetch(neuralVQGridL0G0, ivec3(n01, channel_to_sample), 0).r);
+                    vq_idx_11 = uint(texelFetch(neuralVQGridL0G0, ivec3(n11, channel_to_sample), 0).r);
+                    break;
+                case 1:
+                    channel_to_sample = uint(grid0l1_channels.indices[i]);
+                    vq_idx_00 = uint(texelFetch(neuralVQGridL1G0, ivec3(n00, channel_to_sample), 0).r);
+                    vq_idx_10 = uint(texelFetch(neuralVQGridL1G0, ivec3(n10, channel_to_sample), 0).r);
+                    vq_idx_01 = uint(texelFetch(neuralVQGridL1G0, ivec3(n01, channel_to_sample), 0).r);
+                    vq_idx_11 = uint(texelFetch(neuralVQGridL1G0, ivec3(n11, channel_to_sample), 0).r);
+                    break;
+                case 2:
+                    channel_to_sample = uint(grid0l2_channels.indices[i]);
+                    vq_idx_00 = uint(texelFetch(neuralVQGridL2G0, ivec3(n00, channel_to_sample), 0).r);
+                    vq_idx_10 = uint(texelFetch(neuralVQGridL2G0, ivec3(n10, channel_to_sample), 0).r);
+                    vq_idx_01 = uint(texelFetch(neuralVQGridL2G0, ivec3(n01, channel_to_sample), 0).r);
+                    vq_idx_11 = uint(texelFetch(neuralVQGridL2G0, ivec3(n11, channel_to_sample), 0).r);
+                    break;
+                case 3:
+                    channel_to_sample = uint(grid0l3_channels.indices[i]);
+                    vq_idx_00 = uint(texelFetch(neuralVQGridL3G0, ivec3(n00, channel_to_sample), 0).r);
+                    vq_idx_10 = uint(texelFetch(neuralVQGridL3G0, ivec3(n10, channel_to_sample), 0).r);
+                    vq_idx_01 = uint(texelFetch(neuralVQGridL3G0, ivec3(n01, channel_to_sample), 0).r);
+                    vq_idx_11 = uint(texelFetch(neuralVQGridL3G0, ivec3(n11, channel_to_sample), 0).r);
+                    break;
             }
 
-            vec2 patch_coords = frac_coords * 4.0;
-            ivec2 patch_base_int = ivec2(floor(patch_coords));
-
-            uint idx00 = uint(clamp(patch_base_int.y,     0, 3)) * 4 + uint(clamp(patch_base_int.x,     0, 3));
-            uint idx10 = uint(clamp(patch_base_int.y,     0, 3)) * 4 + uint(clamp(patch_base_int.x + 1, 0, 3));
-            uint idx01 = uint(clamp(patch_base_int.y + 1, 0, 3)) * 4 + uint(clamp(patch_base_int.x,     0, 3));
-            uint idx11 = uint(clamp(patch_base_int.y + 1, 0, 3)) * 4 + uint(clamp(patch_base_int.x + 1, 0, 3));
-            
-            float f00 = get_feature_from_codebook(vq_index, idx00);
-            float f10 = get_feature_from_codebook(vq_index, idx10);
-            float f01 = get_feature_from_codebook(vq_index, idx01);
-            float f11 = get_feature_from_codebook(vq_index, idx11);
+            float f00 = get_feature_from_codebook(vq_idx_00, idx00);
+            float f10 = get_feature_from_codebook(vq_idx_10, idx01);
+            float f01 = get_feature_from_codebook(vq_idx_01, idx10);
+            float f11 = get_feature_from_codebook(vq_idx_11, idx11);
 
             features[feature_count++] = f00 * w00;
             features[feature_count++] = f10 * w10;
@@ -215,22 +250,31 @@ vec4 evaluate_neural_texture(vec2 uv, float lod) {
     if (num_selections_g1 > 0) {
         uvec3 grid_dims = materialParams.featureGridShapes[level_idx][1].xyz;
         vec2 grid_coords = uv * vec2(grid_dims.z, grid_dims.y);
-        ivec2 base_coords_int = ivec2(floor(grid_coords - 0.5));
-        vec2 current_frac_coords = fract(grid_coords - 0.5);
+        ivec2 base_coords_int = ivec2(floor(grid_coords));
+        vec2 frac_coords = fract(grid_coords);
 
-        if (num_selections_g0 == 0) {
-            frac_coords = current_frac_coords;
-        }
+        float w11 = frac_coords.x * frac_coords.y;
+        float w10 = frac_coords.x * (1.0 - frac_coords.y);
+        float w01 = (1.0 - frac_coords.x) * frac_coords.y;
+        float w00 = (1.0 - frac_coords.x) * (1.0 - frac_coords.y);
 
+        ivec2 n00 = (base_coords_int + ivec2(0,0)) % ivec2(grid_dims.z, grid_dims.y);
+        ivec2 n10 = (base_coords_int + ivec2(1,0)) % ivec2(grid_dims.z, grid_dims.y);
+        ivec2 n01 = (base_coords_int + ivec2(0,1)) % ivec2(grid_dims.z, grid_dims.y);
+        ivec2 n11 = (base_coords_int + ivec2(1,1)) % ivec2(grid_dims.z, grid_dims.y);
+
+        vec2 patch_coords = frac_coords * 4.0;
+        ivec2 patch_base_int = ivec2(floor(patch_coords));
+        vec2 patch_frac = fract(patch_coords);
+
+        uint p_idx00 = uint(clamp(patch_base_int.y,     0, 3)) * 4 + uint(clamp(patch_base_int.x,     0, 3));
+        uint p_idx10 = uint(clamp(patch_base_int.y,     0, 3)) * 4 + uint(clamp(patch_base_int.x + 1, 0, 3));
+        uint p_idx01 = uint(clamp(patch_base_int.y + 1, 0, 3)) * 4 + uint(clamp(patch_base_int.x,     0, 3));
+        uint p_idx11 = uint(clamp(patch_base_int.y + 1, 0, 3)) * 4 + uint(clamp(patch_base_int.x + 1, 0, 3));
+
+        uint vq_idx_00, vq_idx_10, vq_idx_01, vq_idx_11;
         for (int i = 0; i < num_selections_g1; ++i) {
             uint channel_to_sample;
-            uint vq_idx_00, vq_idx_10, vq_idx_01, vq_idx_11;
-
-            ivec2 n00 = (base_coords_int + ivec2(0,0)) % ivec2(grid_dims.z, grid_dims.y);
-            ivec2 n10 = (base_coords_int + ivec2(1,0)) % ivec2(grid_dims.z, grid_dims.y);
-            ivec2 n01 = (base_coords_int + ivec2(0,1)) % ivec2(grid_dims.z, grid_dims.y);
-            ivec2 n11 = (base_coords_int + ivec2(1,1)) % ivec2(grid_dims.z, grid_dims.y);
-
             switch(level_idx) {
                 case 0:
                     channel_to_sample = uint(grid1l0_channels.indices[i]);
@@ -261,47 +305,84 @@ vec4 evaluate_neural_texture(vec2 uv, float lod) {
                     vq_idx_11 = uint(texelFetch(neuralVQGridL3G1, ivec3(n11, channel_to_sample), 0).r);
                     break;
             }
-            
-            vec2 patch_coords = current_frac_coords * 4.0;
-            ivec2 patch_base_int = ivec2(floor(patch_coords));
-            vec2 patch_frac = fract(patch_coords);
 
-            uint p_idx00 = uint(clamp(patch_base_int.y,     0, 3)) * 4 + uint(clamp(patch_base_int.x,     0, 3));
-            uint p_idx10 = uint(clamp(patch_base_int.y,     0, 3)) * 4 + uint(clamp(patch_base_int.x + 1, 0, 3));
-            uint p_idx01 = uint(clamp(patch_base_int.y + 1, 0, 3)) * 4 + uint(clamp(patch_base_int.x,     0, 3));
-            uint p_idx11 = uint(clamp(patch_base_int.y + 1, 0, 3)) * 4 + uint(clamp(patch_base_int.x + 1, 0, 3));
+            float f00 = get_feature_from_codebook(vq_idx_00, p_idx00);
+            float f10 = get_feature_from_codebook(vq_idx_10, p_idx01);
+            float f01 = get_feature_from_codebook(vq_idx_01, p_idx10);
+            float f11 = get_feature_from_codebook(vq_idx_11, p_idx11);
+            float interp_val = f00 * w00 + f10 * w10 + f01 * w01 + f11 * w11;
 
-            float feat_00 = mix(get_feature_from_codebook(vq_idx_00, p_idx00), get_feature_from_codebook(vq_idx_00, p_idx10), patch_frac.x);
-            float feat_01 = mix(get_feature_from_codebook(vq_idx_00, p_idx01), get_feature_from_codebook(vq_idx_00, p_idx11), patch_frac.x);
-            float v0 = mix(feat_00, feat_01, patch_frac.y);
-
-            float feat_10 = mix(get_feature_from_codebook(vq_idx_10, p_idx00), get_feature_from_codebook(vq_idx_10, p_idx10), patch_frac.x);
-            float feat_11 = mix(get_feature_from_codebook(vq_idx_10, p_idx01), get_feature_from_codebook(vq_idx_10, p_idx11), patch_frac.x);
-            float v1 = mix(feat_10, feat_11, patch_frac.y);
-            
-            float feat_20 = mix(get_feature_from_codebook(vq_idx_01, p_idx00), get_feature_from_codebook(vq_idx_01, p_idx10), patch_frac.x);
-            float feat_21 = mix(get_feature_from_codebook(vq_idx_01, p_idx01), get_feature_from_codebook(vq_idx_01, p_idx11), patch_frac.x);
-            float v2 = mix(feat_20, feat_21, patch_frac.y);
-            
-            float feat_30 = mix(get_feature_from_codebook(vq_idx_11, p_idx00), get_feature_from_codebook(vq_idx_11, p_idx10), patch_frac.x);
-            float feat_31 = mix(get_feature_from_codebook(vq_idx_11, p_idx01), get_feature_from_codebook(vq_idx_11, p_idx11), patch_frac.x);
-            float v3 = mix(feat_30, feat_31, patch_frac.y);
-            
-            float interp_x1 = mix(v0, v1, current_frac_coords.x);
-            float interp_x2 = mix(v2, v3, current_frac_coords.x);
-            features[feature_count++] = mix(interp_x1, interp_x2, current_frac_coords.y);
+            features[feature_count++] = interp_val;
         }
     }
+    //TODO insert padding with 0s between last feature and the positional encoding for different LODS
 
     // --- 4. Append Positional Encoding & LOD ---
     if(num_selections_g0 > 0 || num_selections_g1 > 0){
-        append_positional_encoding_static(features, feature_count, frac_coords);
+        vec2 absolute_coords = uv * RESOLUTION;
+        append_positional_encoding_static(features, feature_count, absolute_coords);
         feature_count += 11;
-        return vec4(0.0,1.0,0.0,1.0); // Green working color
     }
     features[feature_count++] = lod;
 
-    return vec4(1.0, 0.0, 1.0, 1.0); // Magenta error color
+    // --- 5. MLP ---
+    const float LEAKY_RELU_SLOPE = 0.01;
+
+    // ---- Layer 0 ----
+    uint layer0_out_channels = materialParams.mlpLayerShapes[0].y;
+    uint layer0_in_channels = materialParams.mlpLayerShapes[0].x;
+    
+    // Activations should be full 32-bit floats for precision
+    float layer0_activations[32]; // Keep this as float
+
+    for(int out_ch = 0; out_ch < layer0_out_channels; ++out_ch) {
+        // Load bias (F16) and convert to float
+        float accumulator = float(mlpL0_B.data[out_ch]); 
+        
+        for(int in_ch = 0; in_ch < min(uint(feature_count), layer0_in_channels); ++in_ch) {
+            // Load weight (F16), convert to float for the multiplication
+            float weight = float(mlpL0_W.data[out_ch * layer0_in_channels + in_ch]);
+            accumulator += features[in_ch] * weight;
+        }
+        layer0_activations[out_ch] = max(accumulator, accumulator * LEAKY_RELU_SLOPE);
+    }
+
+    // ---- Layer 1 ----
+    uint layer1_out_channels = materialParams.mlpLayerShapes[1].y;
+    uint layer1_in_channels = materialParams.mlpLayerShapes[1].x;
+    float layer1_activations[32]; // Keep as float
+
+    for(int out_ch = 0; out_ch < layer1_out_channels; ++out_ch) {
+        float accumulator = float(mlpL1_B.data[out_ch]);
+        
+        // Input to this layer comes from the previous layer's activations
+        for(int in_ch = 0; in_ch < min(layer0_out_channels, layer1_in_channels); ++in_ch) {
+            float weight = float(mlpL1_W.data[out_ch * layer1_in_channels + in_ch]);
+            accumulator += layer0_activations[in_ch] * weight;
+        }
+        layer1_activations[out_ch] = max(accumulator, accumulator * LEAKY_RELU_SLOPE);
+    }
+    
+    // ---- Layer 2 (Final Layer) ----
+    uint final_out_channels = materialParams.mlpLayerShapes[2].y;
+    uint final_in_channels = materialParams.mlpLayerShapes[2].x;
+    vec4 final_color = vec4(0.0, 0.0, 0.0, 1.0);
+
+    for(int out_ch = 0; out_ch < final_out_channels; ++out_ch) {
+        float accumulator = float(mlpL2_B.data[out_ch]);
+        
+        for(int in_ch = 0; in_ch < min(layer1_out_channels, final_in_channels); ++in_ch) {
+            float weight = float(mlpL2_W.data[out_ch * final_in_channels + in_ch]);
+            accumulator += layer1_activations[in_ch] * weight;
+        }
+        
+        if(out_ch < 4) {
+          final_color[out_ch] = accumulator;
+        }
+    }
+
+    // Return the calculated color
+    return final_color; 
 }
 
 void main() {
