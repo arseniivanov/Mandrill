@@ -958,18 +958,49 @@ void Scene::compile()
     VkDeviceSize alignedSize = Helpers::alignTo(sizeof(MaterialParams), alignment);
 
     // Get a raw byte pointer to the start of the mapped buffer
+
     uint8_t* base_ptr = static_cast<uint8_t*>(mpMaterialParams->getHostMap());
 
     // Loop and copy to the CORRECT, ALIGNED locations
     for (uint32_t i = 0; i < mMaterials.size(); i++) {
         // Calculate the correct byte offset for the current material
         VkDeviceSize currentOffset = i * alignedSize;
+        Material& mat = mMaterials[i];
+
+        // Start with the existing parameters from the material
+        MaterialParams params_to_copy = mat.params;
+
+        // If it's a neural material, augment it with the loaded denorm data
+        if (mat.isNeuralTexture && mat.pCpuNeuralMaterialData) {
+            const auto& cpu_data = *mat.pCpuNeuralMaterialData;
+            uint32_t count = static_cast<uint32_t>(cpu_data.denorm_mean.size());
+
+            params_to_copy.denormChannelCount = count;
+
+            if (count > MAX_MATERIAL_CHANNELS) {
+                Log::Warning("Material '{}' has {} denorm channels, but layout only supports {}. Clamping.", mat.name,
+                             count, MAX_MATERIAL_CHANNELS);
+                count = MAX_MATERIAL_CHANNELS;
+            }
+
+            // Zero out the arrays first to prevent garbage data in padding
+            memset(params_to_copy.denormMean, 0, sizeof(params_to_copy.denormMean));
+            memset(params_to_copy.denormStd, 0, sizeof(params_to_copy.denormStd));
+
+            // Copy the valid data
+            if (count > 0) {
+                memcpy(params_to_copy.denormMean, cpu_data.denorm_mean.data(), sizeof(float) * count);
+                memcpy(params_to_copy.denormStd, cpu_data.denorm_std.data(), sizeof(float) * count);
+            }
+        } else {
+            params_to_copy.denormChannelCount = 0;
+        }
 
         // Get the destination pointer by adding the byte offset to the base pointer
         MaterialParams* dest_ptr = reinterpret_cast<MaterialParams*>(base_ptr + currentOffset);
 
-        // Now copy the data to the correct, calculated destination
-        *dest_ptr = mMaterials[i].params;
+        // Now copy the fully populated struct to the correct, calculated destination
+        *dest_ptr = params_to_copy;
     }
 
     // Create dummy buffer for unused descriptor slots

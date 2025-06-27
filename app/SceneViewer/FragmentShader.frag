@@ -1,6 +1,8 @@
 #version 460
 #extension GL_EXT_samplerless_texture_functions : require
 #extension GL_EXT_shader_16bit_storage : require
+#extension GL_NV_cooperative_vector : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 
 layout(location = 0) in vec3 inNormal;
 layout(location = 1) in vec2 inTexCoord;
@@ -14,6 +16,7 @@ layout(location = 0) out vec4 fragColor;
 #define MAX_NEURAL_FEATURE_GRID_LEVELS 4
 #define MAX_MLP_LAYERS 3
 #define RESOLUTION 1024
+#define MAX_MATERIAL_CHANNELS 16 
 
 const uint DIFFUSE_TEXTURE_BIT  = 1 << 0;
 const uint SPECULAR_TEXTURE_BIT = 1 << 1;
@@ -51,6 +54,12 @@ layout(set = 2, binding = 0) uniform MaterialParamsUBO {
     uvec4 channelCounts[MAX_NEURAL_FEATURE_GRID_LEVELS];
     uvec4 featureGridShapes[MAX_NEURAL_FEATURE_GRID_LEVELS][2];
     uvec4 mlpLayerShapes[MAX_MLP_LAYERS];
+    vec4 denormMean[MAX_MATERIAL_CHANNELS / 4];
+    vec4 denormStd[MAX_MATERIAL_CHANNELS / 4];
+    uint denormChannelCount;
+    float denorm_pad0;
+    float denorm_pad1;
+    float denorm_pad2;
 } materialParams;
 
 // Standard Textures (bindings 1-5)
@@ -187,31 +196,49 @@ vec4 evaluate_neural_texture(vec2 uv, float lod) {
     // --- 2. Grid 0 Feature Gathering (4 scaled features per channel) ---
     uint num_selections_g0 = materialParams.channelCounts[level_idx].x;
     if (num_selections_g0 > 0) {
-        uvec3 grid_dims = materialParams.featureGridShapes[level_idx][0].xyz;
+        uvec3 grid_dims = materialParams.featureGridShapes[level_idx][0].xyz; //feature grid shape (channels, width, height)
         vec2 rotated_uv = -vec2(uv.y, uv.x);
-        vec2 grid_coords = rotated_uv * vec2(grid_dims.z, grid_dims.y);
-        ivec2 base_coords_int = ivec2(floor(grid_coords));
-        frac_coords = fract(grid_coords);
 
-        float w11 = frac_coords.x * frac_coords.y;
-        float w10 = frac_coords.x * (1.0 - frac_coords.y);
-        float w01 = (1.0 - frac_coords.x) * frac_coords.y;
-        float w00 = (1.0 - frac_coords.x) * (1.0 - frac_coords.y);
+        // We simulate an unfolded feature space (64x64 -> 256x256 for LOD 0)
+        vec2 conceptual_map_size = vec2(grid_dims.z, grid_dims.y) * 4.0;
+        vec2 conceptual_coord_float = rotated_uv * conceptual_map_size;
         
-        ivec2 fetch_coord_int = ivec2(int(grid_coords.x), int(grid_coords.y)) % ivec2(grid_dims.z, grid_dims.y);
+        ivec2 p00_coord = ivec2(floor(conceptual_coord_float));
+        vec2 frac = fract(conceptual_coord_float);
 
-        vec2 patch_coords = frac_coords * 4.0;
-        ivec2 patch_base_int = ivec2(floor(patch_coords));
-        uint idx00 = uint(clamp(patch_base_int.y,     0, 3)) * 4 + uint(clamp(patch_base_int.x,     0, 3));
-        uint idx01 = uint(clamp(patch_base_int.y,     0, 3)) * 4 + uint(clamp(patch_base_int.x + 1, 0, 3));
-        uint idx10 = uint(clamp(patch_base_int.y + 1, 0, 3)) * 4 + uint(clamp(patch_base_int.x,     0, 3));
-        uint idx11 = uint(clamp(patch_base_int.y + 1, 0, 3)) * 4 + uint(clamp(patch_base_int.x + 1, 0, 3));
+        float w11 = frac.x * frac.y;
+        float w10 = frac.x * (1.0 - frac.y);
+        float w01 = (1.0 - frac.x) * frac.y;
+        float w00 = (1.0 - frac.x) * (1.0 - frac.y);
+        
+        // We will now calculate the VQ grid neighbors and sub-indices for EACH of the 4 corners.
+        
+        // For the Top-Left corner (p00)
+        ivec2 n00 = p00_coord / 4;
+        uint  idx00 = uint(p00_coord.y % 4) * 4 + uint(p00_coord.x % 4);
 
-        ivec2 n00 = (base_coords_int + ivec2(0,0)) % ivec2(grid_dims.z, grid_dims.y);
-        ivec2 n10 = (base_coords_int + ivec2(1,0)) % ivec2(grid_dims.z, grid_dims.y);
-        ivec2 n01 = (base_coords_int + ivec2(0,1)) % ivec2(grid_dims.z, grid_dims.y);
-        ivec2 n11 = (base_coords_int + ivec2(1,1)) % ivec2(grid_dims.z, grid_dims.y);
+        // For the Top-Right corner (p10)
+        ivec2 p10_coord = p00_coord + ivec2(1, 0);
+        ivec2 n10 = p10_coord / 4;
+        uint  idx10 = uint(p10_coord.y % 4) * 4 + uint(p10_coord.x % 4);
 
+        // For the Bottom-Left corner (p01)
+        ivec2 p01_coord = p00_coord + ivec2(0, 1);
+        ivec2 n01 = p01_coord / 4;
+        uint  idx01 = uint(p01_coord.y % 4) * 4 + uint(p01_coord.x % 4);
+
+        // For the Bottom-Right corner (p11)
+        ivec2 p11_coord = p00_coord + ivec2(1, 1);
+        ivec2 n11 = p11_coord / 4;
+        uint  idx11 = uint(p11_coord.y % 4) * 4 + uint(p11_coord.x % 4);
+
+        // Apply wrapping to all VQ grid neighbor coordinates.
+        ivec2 grid_size = ivec2(grid_dims.z, grid_dims.y);
+        n00 %= grid_size; if(n00.x < 0) n00.x += grid_size.x; if(n00.y < 0) n00.y += grid_size.y;
+        n10 %= grid_size; if(n10.x < 0) n10.x += grid_size.x; if(n10.y < 0) n10.y += grid_size.y;
+        n01 %= grid_size; if(n01.x < 0) n01.x += grid_size.x; if(n01.y < 0) n01.y += grid_size.y;
+        n11 %= grid_size; if(n11.x < 0) n11.x += grid_size.x; if(n11.y < 0) n11.y += grid_size.y;
+        
         uint vq_idx_00; 
         uint vq_idx_10; 
         uint vq_idx_01; 
@@ -266,30 +293,43 @@ vec4 evaluate_neural_texture(vec2 uv, float lod) {
     if (num_selections_g1 > 0) {
         uvec3 grid_dims = materialParams.featureGridShapes[level_idx][1].xyz;
         vec2 rotated_uv = -vec2(uv.y, uv.x);
-        vec2 grid_coords = rotated_uv * vec2(grid_dims.z, grid_dims.y);
-        ivec2 base_coords_int = ivec2(floor(grid_coords));
-        vec2 frac_coords = fract(grid_coords);
 
-        float w11 = frac_coords.x * frac_coords.y;
-        float w10 = frac_coords.x * (1.0 - frac_coords.y);
-        float w01 = (1.0 - frac_coords.x) * frac_coords.y;
-        float w00 = (1.0 - frac_coords.x) * (1.0 - frac_coords.y);
+        // 1. Calculate the continuous coordinate on the high-resolution "conceptual" map.
+        vec2 conceptual_map_size = vec2(grid_dims.z, grid_dims.y) * 4.0;
+        vec2 conceptual_coord_float = rotated_uv * conceptual_map_size;
 
-        ivec2 n00 = (base_coords_int + ivec2(0,0)) % ivec2(grid_dims.z, grid_dims.y);
-        ivec2 n10 = (base_coords_int + ivec2(1,0)) % ivec2(grid_dims.z, grid_dims.y);
-        ivec2 n01 = (base_coords_int + ivec2(0,1)) % ivec2(grid_dims.z, grid_dims.y);
-        ivec2 n11 = (base_coords_int + ivec2(1,1)) % ivec2(grid_dims.z, grid_dims.y);
+        // 2. Find the top-left integer corner (p00) and the fractional part for interpolation.
+        ivec2 p00_coord = ivec2(floor(conceptual_coord_float));
+        vec2 frac = fract(conceptual_coord_float);
 
-        vec2 patch_coords = frac_coords * 4.0;
-        ivec2 patch_base_int = ivec2(floor(patch_coords));
-        vec2 patch_frac = fract(patch_coords);
+        // Define the other 3 corner points in the conceptual map space.
+        ivec2 p10_coord = p00_coord + ivec2(1, 0);
+        ivec2 p01_coord = p00_coord + ivec2(0, 1);
+        ivec2 p11_coord = p00_coord + ivec2(1, 1);
+        
+        // 3. Deconstruct each of the 4 conceptual points into its VQ-Grid and Sub-Texel parts.
+        // We re-purpose your 'n' variables for the VQ grid coordinates.
+        ivec2 n00 = p00_coord / 4;
+        ivec2 n10 = p10_coord / 4;
+        ivec2 n01 = p01_coord / 4;
+        ivec2 n11 = p11_coord / 4;
 
-        uint p_idx00 = uint(clamp(patch_base_int.y,     0, 3)) * 4 + uint(clamp(patch_base_int.x,     0, 3));
-        uint p_idx10 = uint(clamp(patch_base_int.y,     0, 3)) * 4 + uint(clamp(patch_base_int.x + 1, 0, 3));
-        uint p_idx01 = uint(clamp(patch_base_int.y + 1, 0, 3)) * 4 + uint(clamp(patch_base_int.x,     0, 3));
-        uint p_idx11 = uint(clamp(patch_base_int.y + 1, 0, 3)) * 4 + uint(clamp(patch_base_int.x + 1, 0, 3));
+        // We re-purpose your 'p_idx' variables for the sub-feature indices.
+        uint p_idx00 = uint(p00_coord.y % 4) * 4 + uint(p00_coord.x % 4);
+        uint p_idx10 = uint(p10_coord.y % 4) * 4 + uint(p10_coord.x % 4);
+        uint p_idx01 = uint(p01_coord.y % 4) * 4 + uint(p01_coord.x % 4);
+        uint p_idx11 = uint(p11_coord.y % 4) * 4 + uint(p11_coord.x % 4);
 
+        // 4. Apply wrapping to all VQ grid coordinates.
+        ivec2 grid_size = ivec2(grid_dims.z, grid_dims.y);
+        n00 %= grid_size; if(n00.x < 0) n00.x += grid_size.x; if(n00.y < 0) n00.y += grid_size.y;
+        n10 %= grid_size; if(n10.x < 0) n10.x += grid_size.x; if(n10.y < 0) n10.y += grid_size.y;
+        n01 %= grid_size; if(n01.x < 0) n01.x += grid_size.x; if(n01.y < 0) n01.y += grid_size.y;
+        n11 %= grid_size; if(n11.x < 0) n11.x += grid_size.x; if(n11.y < 0) n11.y += grid_size.y;
+
+        // Keep your VQ index variables.
         uint vq_idx_00, vq_idx_10, vq_idx_01, vq_idx_11;
+        
         for (int i = 0; i < num_selections_g1; ++i) {
             uint channel_to_sample;
             switch(level_idx) {
@@ -323,14 +363,14 @@ vec4 evaluate_neural_texture(vec2 uv, float lod) {
                     break;
             }
 
-            float v00 = interpolate_vq_patch(vq_idx_00, p_idx00, p_idx10, p_idx01, p_idx11, patch_frac);
-            float v10 = interpolate_vq_patch(vq_idx_10, p_idx00, p_idx10, p_idx01, p_idx11, patch_frac);
-            float v01 = interpolate_vq_patch(vq_idx_01, p_idx00, p_idx10, p_idx01, p_idx11, patch_frac);
-            float v11 = interpolate_vq_patch(vq_idx_11, p_idx00, p_idx10, p_idx01, p_idx11, patch_frac);
+            float f00 = get_feature_from_codebook(vq_idx_00, p_idx00);
+            float f10 = get_feature_from_codebook(vq_idx_10, p_idx10);
+            float f01 = get_feature_from_codebook(vq_idx_01, p_idx01);
+            float f11 = get_feature_from_codebook(vq_idx_11, p_idx11);
 
-            float interp_x1 = mix(v00, v10, frac_coords.x);
-            float interp_x2 = mix(v01, v11, frac_coords.x);
-            float final_feature = mix(interp_x1, interp_x2, frac_coords.y);
+            float interp_x1 = mix(f00, f10, frac.x);
+            float interp_x2 = mix(f01, f11, frac.x);
+            float final_feature = mix(interp_x1, interp_x2, frac.y);
 
             features[feature_count++] = final_feature;
         }
@@ -395,6 +435,12 @@ vec4 evaluate_neural_texture(vec2 uv, float lod) {
             float weight = float(mlpL2_W.data[out_ch * final_in_channels + in_ch]);
             accumulator += layer1_activations[in_ch] * weight;
         }
+
+        if (out_ch < materialParams.denormChannelCount) {
+            float mean = materialParams.denormMean[out_ch / 4][out_ch % 4];
+            float std  = materialParams.denormStd[out_ch / 4][out_ch % 4];
+            accumulator = accumulator * std + mean;
+        }
         
         if(out_ch < 4) {
           final_color[out_ch] = accumulator;
@@ -406,9 +452,6 @@ vec4 evaluate_neural_texture(vec2 uv, float lod) {
 }
 
 void main() {
-    if (materialParams.isNeuralTexture == 1u) {
-        fragColor = evaluate_neural_texture(inTexCoord, pushConstant.lod);
-    }else {
       // Diffuse (default)
       if ((materialParams.hasTexture & DIFFUSE_TEXTURE_BIT) != 0) {
           fragColor = texture(diffuseTexture, inTexCoord);
@@ -480,8 +523,29 @@ void main() {
 
       // NTC placeholder
       if (pushConstant.renderMode == 9) {
-          fragColor = vec4(0.5, 0.5, 0.5, 1.0);
-      }
+          vec2 uv = inTexCoord;
+          vec2 texel_size = vec2(1.0 / RESOLUTION);
+
+          // Find the 4 texel centers around the input uv
+          vec2 uv00 = (floor(uv * RESOLUTION) + vec2(0.5, 0.5)) * texel_size;
+          vec2 uv10 = uv00 + vec2(texel_size.x, 0.0);
+          vec2 uv01 = uv00 + vec2(0.0, texel_size.y);
+          vec2 uv11 = uv00 + vec2(texel_size.x, texel_size.y);
+
+          // Run the MLP 4 times
+          vec4 t00 = evaluate_neural_texture(uv00, pushConstant.lod);
+          vec4 t10 = evaluate_neural_texture(uv10, pushConstant.lod);
+          vec4 t01 = evaluate_neural_texture(uv01, pushConstant.lod);
+          vec4 t11 = evaluate_neural_texture(uv11, pushConstant.lod);
+
+          // Manually blend them based on the fractional part of the original UV
+          vec2 f = fract(uv * RESOLUTION);
+          vec4 top = mix(t00, t10, f.x);
+          vec4 bottom = mix(t01, t11, f.x);
+          
+          fragColor = mix(top, bottom, f.y);
+
+        //fragColor = evaluate_neural_texture(uv, pushConstant.lod);
 
       // Line render
       if (pushConstant.renderMode == 10) {

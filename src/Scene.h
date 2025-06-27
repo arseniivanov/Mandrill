@@ -14,7 +14,7 @@
 #include "model_loader.h"
 #define MAX_NEURAL_FEATURE_GRID_LEVELS 4
 #define MAX_MLP_LAYERS 3
-
+#define MAX_MATERIAL_CHANNELS 16
 
 struct pair_hash {
     template <class T1, class T2> std::size_t operator()(const std::pair<T1, T2>& p) const
@@ -72,6 +72,14 @@ namespace Mandrill
         glm::uvec4 channelCounts[MAX_NEURAL_FEATURE_GRID_LEVELS];
         glm::uvec4 featureGridShapes[MAX_NEURAL_FEATURE_GRID_LEVELS][2];
         glm::uvec4 mlpLayerShapes[MAX_MLP_LAYERS]; // .x=in, .y=out
+
+        glm::vec4 denormMean[MAX_MATERIAL_CHANNELS / 4];
+        glm::vec4 denormStd[MAX_MATERIAL_CHANNELS / 4];
+
+        uint32_t denormChannelCount;
+        float denorm_pad0;
+        float denorm_pad1;
+        float denorm_pad2;
     };
 
     struct alignas(16) MaterialDevice {

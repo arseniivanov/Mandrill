@@ -26,6 +26,18 @@ SafetensorsModelData::SafetensorsModelData() : uses_vq(false), uses_combined_fea
 }
 
 // --- Helper functions for parsing tensor names (same as before) ---
+bool parse_denorm_tensor_name(const std::string& name, std::string& material_id, bool& is_mean)
+{
+    static const std::regex denorm_regex("denorm_([a-zA-Z0-9_\\.\\-]+)_(mean|std)");
+    std::smatch match;
+    if (std::regex_match(name, match, denorm_regex)) {
+        material_id = match[1].str();
+        is_mean = (match[2].str() == "mean");
+        return true;
+    }
+    return false;
+}
+
 bool parse_mlp_tensor_name(const std::string& name, std::string& material_id, int& layer_idx, bool& is_weights)
 {
     static const std::regex mlp_regex("mlp_([a-zA-Z0-9_\\.\\-]+)_layer_(\\d+)_(weights|bias)");
@@ -286,15 +298,42 @@ bool load_model_from_safetensors(const std::string& filename, SafetensorsModelDa
                 // If they can be per-material, then uses_combined_features might remain false.
                 // Current VQ-focused logic doesn't alter combined_feature_key_name for raw packed.
             }
-            // --- End of Corrected Logic for FeatureGrids ---
 
             if (fgd.level_idx != -1) {
                 model_data.max_level_idx = std::max(model_data.max_level_idx, fgd.level_idx);
             }
-        } else { // End of the 'else if' for feature grids
+        } else if (name.rfind("denorm_", 0) == 0) { // Starts with "denorm_"
+            std::string material_id_denorm;
+            bool is_mean_denorm;
+            if (parse_denorm_tensor_name(name, material_id_denorm, is_mean_denorm)) {
+                if (tensor_info.dtype != safetensors::dtype::kFLOAT32) {
+                    std::cerr << "Error: Denorm tensor '" << name << "' has unexpected dtype. Expected F32."
+                              << std::endl;
+                    continue;
+                }
+                MaterialSpecificData& mat_data = model_data.materials[material_id_denorm];
+                if (mat_data.id.empty())
+                    mat_data.id = material_id_denorm;
+
+                std::vector<float>* target_vec = is_mean_denorm ? &mat_data.denorm_mean : &mat_data.denorm_std;
+
+                std::vector<uint8_t> raw_data;
+                copy_tensor_data(raw_data, st_data, tensor_info);
+                if (raw_data.size() % sizeof(float) != 0) {
+                    std::cerr << "Error: Denorm data for '" << name << "' is not a multiple of float size."
+                              << std::endl;
+                    continue;
+                }
+                target_vec->resize(raw_data.size() / sizeof(float));
+                std::memcpy(target_vec->data(), raw_data.data(), raw_data.size());
+            }
+        }
+
+        else { // End of the 'else if' for feature grids
             std::cout << "Info: Unhandled tensor: " << name << std::endl;
         }
-    } // End of tensor loop
+        // --- End of Corrected Logic for FeatureGrids ---
+    }
 
     // Final check for uses_combined_features is now simpler:
     // If combined_feature_key_name was set (which happens if VQ grids were found and had a base key),
@@ -303,9 +342,10 @@ bool load_model_from_safetensors(const std::string& filename, SafetensorsModelDa
     // If uses_vq is true but combined_feature_key_name is STILL empty after the loop,
     // it implies VQ grids were found but had no parsable base_feature_key, which is an error state.
     if (model_data.uses_vq && model_data.combined_feature_key_name.empty() && !model_data.named_feature_grids.empty()) {
-        std::cerr
-            << "Error: VQ is active and VQ grids were loaded, but no combined_feature_key_name could be established. "
-            << "This indicates an issue with parsing VQ grid names or an unexpected model structure." << std::endl;
+        std::cerr << "Error: VQ is active and VQ grids were loaded, but no combined_feature_key_name could be "
+                     "established. "
+                  << "This indicates an issue with parsing VQ grid names or an unexpected model structure."
+                  << std::endl;
         model_data.uses_combined_features = false; // Cannot assume combined without a key
     }
     // Note: uses_combined_features is already true if combined_feature_key_name was set.
@@ -392,6 +432,15 @@ void print_model_data_summary(const SafetensorsModelData& data)
             }
             std::cout << std::endl;
         }
+        std::cout << "    Denorm Mean (" << mat_data.denorm_mean.size() << " values): ";
+        for (float v : mat_data.denorm_mean)
+            std::cout << v << " ";
+        std::cout << std::endl;
+
+        std::cout << "    Denorm Std (" << mat_data.denorm_std.size() << " values): ";
+        for (float v : mat_data.denorm_std)
+            std::cout << v << " ";
+        std::cout << std::endl;
     }
     std::cout << "--- End of Summary ---" << std::endl;
 }

@@ -89,6 +89,8 @@ struct MaterialSpecificData {
     std::string id;
     std::map<int, ChannelSelections> level_channel_selections;
     std::vector<MLPLayer> mlp_layers;
+    std::vector<float> denorm_mean;
+    std::vector<float> denorm_std;
 };
 
 struct SafetensorsModelData {
