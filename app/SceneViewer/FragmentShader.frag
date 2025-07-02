@@ -113,15 +113,11 @@ layout(set = 3, binding = 3) readonly buffer PositionalEncodingBuffer { float da
 // =========================================================================
 
 const int POS_ENCODING_TABLE_SIZE = 8;
-const int POS_ENCODING_FEATURES_PER_DIM = 5; // 3 octaves * 2 offsets - 1 skipped
-
-uint unpack_2bit_value(uint byte, uint index_in_byte) {
-    return (byte >> (index_in_byte * 2)) & 0x03u;
-}
+const int POS_ENCODING_FEATURES_PER_DIM = 6; // 3 octaves * 2 offsets - 1 skipped
 
 float get_feature_from_codebook(uint vq_index, uint feature_index) {
     const uint bytes_per_patch = 4; // 16 features * 2 bits/feature = 32 bits = 4 bytes
-    uint byte_offset_in_patch = feature_index / 4;
+    uint byte_offset_in_patch = feature_index / 4; //
     uint total_byte_offset = (vq_index * bytes_per_patch) + byte_offset_in_patch;
 
     uint dword_index = total_byte_offset / 4;
@@ -134,50 +130,33 @@ float get_feature_from_codebook(uint vq_index, uint feature_index) {
     return paletteBuffer.data[palette_index];
 }
 
+int mod(int x, int m) {
+    return (x % m + m) % m;
+}
+
 void append_positional_encoding_static(inout float features[128], int base_feature_index, vec2 coords) {
     ivec2 int_coords = ivec2(coords);
-    int ix = int_coords.x % POS_ENCODING_TABLE_SIZE;
-    int iy = int_coords.y % POS_ENCODING_TABLE_SIZE;
+    int ix = mod(int_coords.x, POS_ENCODING_TABLE_SIZE);
+    int iy = mod(int_coords.y, POS_ENCODING_TABLE_SIZE);
 
     // Calculate the starting offset into the buffer for our x and y table entries
     int base_lookup_idx_x = ix * POS_ENCODING_FEATURES_PER_DIM;
     int base_lookup_idx_y = iy * POS_ENCODING_FEATURES_PER_DIM;
 
-    // Manually unroll all 11 feature appends.
-    // The compiler can optimize these static-indexed writes much better.
-    // Octave 0, Offset 0.0 (skipped for x)
-    features[base_feature_index + 0]  = posEncodingBuffer.data[base_lookup_idx_x + 0]; // Corresponds to octave 0, offset 0.0
-    features[base_feature_index + 1]  = posEncodingBuffer.data[base_lookup_idx_y + 0];
+    // Manually unroll all 12 feature appends.
+    features[base_feature_index + 0] = posEncodingBuffer.data[base_lookup_idx_x + 0];
+    features[base_feature_index + 1] = posEncodingBuffer.data[base_lookup_idx_x + 1];
+    features[base_feature_index + 2] = posEncodingBuffer.data[base_lookup_idx_x + 2];
+    features[base_feature_index + 3] = posEncodingBuffer.data[base_lookup_idx_x + 3];
+    features[base_feature_index + 4] = posEncodingBuffer.data[base_lookup_idx_x + 4];
+    features[base_feature_index + 5] = posEncodingBuffer.data[base_lookup_idx_x + 5];
 
-    // Octave 1
-    features[base_feature_index + 2]  = posEncodingBuffer.data[base_lookup_idx_x + 1]; // Corresponds to octave 1, offset 0.5
-    features[base_feature_index + 3]  = posEncodingBuffer.data[base_lookup_idx_y + 1];
-    features[base_feature_index + 4]  = posEncodingBuffer.data[base_lookup_idx_x + 2]; // Corresponds to octave 1, offset 0.0
-    features[base_feature_index + 5]  = posEncodingBuffer.data[base_lookup_idx_y + 2];
-
-    // Octave 2
-    features[base_feature_index + 6]  = posEncodingBuffer.data[base_lookup_idx_x + 3]; // Corresponds to octave 2, offset 0.5
-    features[base_feature_index + 7]  = posEncodingBuffer.data[base_lookup_idx_y + 3];
-    features[base_feature_index + 8]  = posEncodingBuffer.data[base_lookup_idx_x + 4]; // Corresponds to octave 2, offset 0.0
-    features[base_feature_index + 9]  = posEncodingBuffer.data[base_lookup_idx_y + 4];
-
-    // Final zero
-    features[base_feature_index + 10] = 0.0;
-}
-
-float interpolate_vq_patch(uint vq_idx, uint p_idx00, uint p_idx10, uint p_idx01, uint p_idx11, vec2 frac_coords_patch) {
-    // Fetch the four neighboring feature values from the VQ codebook
-    float feat_p00 = get_feature_from_codebook(vq_idx, p_idx00); // Top-left sub-feature
-    float feat_p10 = get_feature_from_codebook(vq_idx, p_idx10); // Top-right sub-feature
-    float feat_p01 = get_feature_from_codebook(vq_idx, p_idx01); // Bottom-left sub-feature
-    float feat_p11 = get_feature_from_codebook(vq_idx, p_idx11); // Bottom-right sub-feature
-
-    // First, interpolate along the X-axis
-    float interp_x1 = mix(feat_p00, feat_p10, frac_coords_patch.x);
-    float interp_x2 = mix(feat_p01, feat_p11, frac_coords_patch.x);
-
-    // Then, interpolate the results along the Y-axis
-    return mix(interp_x1, interp_x2, frac_coords_patch.y);
+    features[base_feature_index + 6] = posEncodingBuffer.data[base_lookup_idx_y + 0];
+    features[base_feature_index + 7] = posEncodingBuffer.data[base_lookup_idx_y + 1];
+    features[base_feature_index + 8] = posEncodingBuffer.data[base_lookup_idx_y + 2];
+    features[base_feature_index + 9] = posEncodingBuffer.data[base_lookup_idx_y + 3];
+    features[base_feature_index + 10] = posEncodingBuffer.data[base_lookup_idx_y + 4];
+    features[base_feature_index + 11] = posEncodingBuffer.data[base_lookup_idx_y + 5];
 }
 
 vec4 evaluate_neural_texture(vec2 uv, float lod) {
@@ -197,11 +176,10 @@ vec4 evaluate_neural_texture(vec2 uv, float lod) {
     uint num_selections_g0 = materialParams.channelCounts[level_idx].x;
     if (num_selections_g0 > 0) {
         uvec3 grid_dims = materialParams.featureGridShapes[level_idx][0].xyz; //feature grid shape (channels, width, height)
-        vec2 rotated_uv = -vec2(uv.y, uv.x);
 
         // We simulate an unfolded feature space (64x64 -> 256x256 for LOD 0)
         vec2 conceptual_map_size = vec2(grid_dims.z, grid_dims.y) * 4.0;
-        vec2 conceptual_coord_float = rotated_uv * conceptual_map_size;
+        vec2 conceptual_coord_float = uv * conceptual_map_size;
         
         ivec2 p00_coord = ivec2(floor(conceptual_coord_float));
         vec2 frac = fract(conceptual_coord_float);
@@ -211,33 +189,21 @@ vec4 evaluate_neural_texture(vec2 uv, float lod) {
         float w01 = (1.0 - frac.x) * frac.y;
         float w00 = (1.0 - frac.x) * (1.0 - frac.y);
         
-        // We will now calculate the VQ grid neighbors and sub-indices for EACH of the 4 corners.
-        
-        // For the Top-Left corner (p00)
-        ivec2 n00 = p00_coord / 4;
-        uint  idx00 = uint(p00_coord.y % 4) * 4 + uint(p00_coord.x % 4);
-
-        // For the Top-Right corner (p10)
         ivec2 p10_coord = p00_coord + ivec2(1, 0);
-        ivec2 n10 = p10_coord / 4;
-        uint  idx10 = uint(p10_coord.y % 4) * 4 + uint(p10_coord.x % 4);
-
-        // For the Bottom-Left corner (p01)
         ivec2 p01_coord = p00_coord + ivec2(0, 1);
-        ivec2 n01 = p01_coord / 4;
-        uint  idx01 = uint(p01_coord.y % 4) * 4 + uint(p01_coord.x % 4);
-
-        // For the Bottom-Right corner (p11)
         ivec2 p11_coord = p00_coord + ivec2(1, 1);
-        ivec2 n11 = p11_coord / 4;
-        uint  idx11 = uint(p11_coord.y % 4) * 4 + uint(p11_coord.x % 4);
-
-        // Apply wrapping to all VQ grid neighbor coordinates.
+        
+        // VQ Grid coordinates (your existing logic is fine here, but let's use your helper for consistency)
         ivec2 grid_size = ivec2(grid_dims.z, grid_dims.y);
-        n00 %= grid_size; if(n00.x < 0) n00.x += grid_size.x; if(n00.y < 0) n00.y += grid_size.y;
-        n10 %= grid_size; if(n10.x < 0) n10.x += grid_size.x; if(n10.y < 0) n10.y += grid_size.y;
-        n01 %= grid_size; if(n01.x < 0) n01.x += grid_size.x; if(n01.y < 0) n01.y += grid_size.y;
-        n11 %= grid_size; if(n11.x < 0) n11.x += grid_size.x; if(n11.y < 0) n11.y += grid_size.y;
+        ivec2 n00 = ivec2(mod(p00_coord.x / 4, grid_size.x), mod(p00_coord.y / 4, grid_size.y));
+        ivec2 n10 = ivec2(mod(p10_coord.x / 4, grid_size.x), mod(p10_coord.y / 4, grid_size.y));
+        ivec2 n01 = ivec2(mod(p01_coord.x / 4, grid_size.x), mod(p01_coord.y / 4, grid_size.y));
+        ivec2 n11 = ivec2(mod(p11_coord.x / 4, grid_size.x), mod(p11_coord.y / 4, grid_size.y));
+
+        uint idx00 = uint(mod(p00_coord.y, 4)) * 4 + uint(mod(p00_coord.x, 4));
+        uint idx10 = uint(mod(p10_coord.y, 4)) * 4 + uint(mod(p10_coord.x, 4));
+        uint idx01 = uint(mod(p01_coord.y, 4)) * 4 + uint(mod(p01_coord.x, 4));
+        uint idx11 = uint(mod(p11_coord.y, 4)) * 4 + uint(mod(p11_coord.x, 4));
         
         uint vq_idx_00; 
         uint vq_idx_10; 
@@ -292,11 +258,10 @@ vec4 evaluate_neural_texture(vec2 uv, float lod) {
     uint num_selections_g1 = materialParams.channelCounts[level_idx].y;
     if (num_selections_g1 > 0) {
         uvec3 grid_dims = materialParams.featureGridShapes[level_idx][1].xyz;
-        vec2 rotated_uv = -vec2(uv.y, uv.x);
 
         // 1. Calculate the continuous coordinate on the high-resolution "conceptual" map.
         vec2 conceptual_map_size = vec2(grid_dims.z, grid_dims.y) * 4.0;
-        vec2 conceptual_coord_float = rotated_uv * conceptual_map_size;
+        vec2 conceptual_coord_float = uv * conceptual_map_size;
 
         // 2. Find the top-left integer corner (p00) and the fractional part for interpolation.
         ivec2 p00_coord = ivec2(floor(conceptual_coord_float));
@@ -307,25 +272,17 @@ vec4 evaluate_neural_texture(vec2 uv, float lod) {
         ivec2 p01_coord = p00_coord + ivec2(0, 1);
         ivec2 p11_coord = p00_coord + ivec2(1, 1);
         
-        // 3. Deconstruct each of the 4 conceptual points into its VQ-Grid and Sub-Texel parts.
-        // We re-purpose your 'n' variables for the VQ grid coordinates.
-        ivec2 n00 = p00_coord / 4;
-        ivec2 n10 = p10_coord / 4;
-        ivec2 n01 = p01_coord / 4;
-        ivec2 n11 = p11_coord / 4;
-
-        // We re-purpose your 'p_idx' variables for the sub-feature indices.
-        uint p_idx00 = uint(p00_coord.y % 4) * 4 + uint(p00_coord.x % 4);
-        uint p_idx10 = uint(p10_coord.y % 4) * 4 + uint(p10_coord.x % 4);
-        uint p_idx01 = uint(p01_coord.y % 4) * 4 + uint(p01_coord.x % 4);
-        uint p_idx11 = uint(p11_coord.y % 4) * 4 + uint(p11_coord.x % 4);
-
-        // 4. Apply wrapping to all VQ grid coordinates.
+        // VQ Grid coordinates (your existing logic is fine here, but let's use your helper for consistency)
         ivec2 grid_size = ivec2(grid_dims.z, grid_dims.y);
-        n00 %= grid_size; if(n00.x < 0) n00.x += grid_size.x; if(n00.y < 0) n00.y += grid_size.y;
-        n10 %= grid_size; if(n10.x < 0) n10.x += grid_size.x; if(n10.y < 0) n10.y += grid_size.y;
-        n01 %= grid_size; if(n01.x < 0) n01.x += grid_size.x; if(n01.y < 0) n01.y += grid_size.y;
-        n11 %= grid_size; if(n11.x < 0) n11.x += grid_size.x; if(n11.y < 0) n11.y += grid_size.y;
+        ivec2 n00 = ivec2(mod(p00_coord.x / 4, grid_size.x), mod(p00_coord.y / 4, grid_size.y));
+        ivec2 n10 = ivec2(mod(p10_coord.x / 4, grid_size.x), mod(p10_coord.y / 4, grid_size.y));
+        ivec2 n01 = ivec2(mod(p01_coord.x / 4, grid_size.x), mod(p01_coord.y / 4, grid_size.y));
+        ivec2 n11 = ivec2(mod(p11_coord.x / 4, grid_size.x), mod(p11_coord.y / 4, grid_size.y));
+
+        uint idx00 = uint(mod(p00_coord.y, 4)) * 4 + uint(mod(p00_coord.x, 4));
+        uint idx10 = uint(mod(p10_coord.y, 4)) * 4 + uint(mod(p10_coord.x, 4));
+        uint idx01 = uint(mod(p01_coord.y, 4)) * 4 + uint(mod(p01_coord.x, 4));
+        uint idx11 = uint(mod(p11_coord.y, 4)) * 4 + uint(mod(p11_coord.x, 4));
 
         // Keep your VQ index variables.
         uint vq_idx_00, vq_idx_10, vq_idx_01, vq_idx_11;
@@ -363,10 +320,10 @@ vec4 evaluate_neural_texture(vec2 uv, float lod) {
                     break;
             }
 
-            float f00 = get_feature_from_codebook(vq_idx_00, p_idx00);
-            float f10 = get_feature_from_codebook(vq_idx_10, p_idx10);
-            float f01 = get_feature_from_codebook(vq_idx_01, p_idx01);
-            float f11 = get_feature_from_codebook(vq_idx_11, p_idx11);
+            float f00 = get_feature_from_codebook(vq_idx_00, idx00);
+            float f10 = get_feature_from_codebook(vq_idx_10, idx10);
+            float f01 = get_feature_from_codebook(vq_idx_01, idx01);
+            float f11 = get_feature_from_codebook(vq_idx_11, idx11);
 
             float interp_x1 = mix(f00, f10, frac.x);
             float interp_x2 = mix(f01, f11, frac.x);
@@ -377,12 +334,9 @@ vec4 evaluate_neural_texture(vec2 uv, float lod) {
     }
     //TODO insert padding with 0s between last feature and the positional encoding for different LODS
 
-    // --- 4. Append Positional Encoding & LOD ---
-    if(num_selections_g0 > 0 || num_selections_g1 > 0){
-        vec2 absolute_coords = uv * RESOLUTION;
-        append_positional_encoding_static(features, feature_count, absolute_coords);
-        feature_count += 11;
-    }
+    vec2 absolute_coords = uv * RESOLUTION;
+    append_positional_encoding_static(features, feature_count, absolute_coords);
+    feature_count += 12;
     features[feature_count++] = lod;
 
     // --- 5. MLP ---
@@ -521,31 +475,10 @@ void main() {
           fragColor = vec4(inTexCoord, 0.0, 1.0);
       }
 
-      // NTC placeholder
+      // NTC 
       if (pushConstant.renderMode == 9) {
           vec2 uv = inTexCoord;
-          vec2 texel_size = vec2(1.0 / RESOLUTION);
-
-          // Find the 4 texel centers around the input uv
-          vec2 uv00 = (floor(uv * RESOLUTION) + vec2(0.5, 0.5)) * texel_size;
-          vec2 uv10 = uv00 + vec2(texel_size.x, 0.0);
-          vec2 uv01 = uv00 + vec2(0.0, texel_size.y);
-          vec2 uv11 = uv00 + vec2(texel_size.x, texel_size.y);
-
-          // Run the MLP 4 times
-          vec4 t00 = evaluate_neural_texture(uv00, pushConstant.lod);
-          vec4 t10 = evaluate_neural_texture(uv10, pushConstant.lod);
-          vec4 t01 = evaluate_neural_texture(uv01, pushConstant.lod);
-          vec4 t11 = evaluate_neural_texture(uv11, pushConstant.lod);
-
-          // Manually blend them based on the fractional part of the original UV
-          vec2 f = fract(uv * RESOLUTION);
-          vec4 top = mix(t00, t10, f.x);
-          vec4 bottom = mix(t01, t11, f.x);
-          
-          fragColor = mix(top, bottom, f.y);
-
-        //fragColor = evaluate_neural_texture(uv, pushConstant.lod);
+          fragColor = evaluate_neural_texture(uv, pushConstant.lod);
 
       // Line render
       if (pushConstant.renderMode == 10) {

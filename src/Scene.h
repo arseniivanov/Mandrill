@@ -104,14 +104,15 @@ namespace Mandrill
 
         // Added field NTC below
         std::string name;
+        std::string neuralLinkName;
         bool isNeuralTexture = false;
         const MaterialSpecificData* pCpuNeuralMaterialData = nullptr;
         // Key: {level_idx, grid_type (0 or 1)}
         std::map<std::pair<int, int>, ptr<Buffer>> neuralChannelSelectionBuffers;
 
         // MLP layer buffers
-        std::vector<ptr<Buffer>> mlpWeightBuffers;
-        std::vector<ptr<Buffer>> mlpBiasBuffers;
+        std::map<int, ptr<Buffer>> mlpWeightBuffers; // Key: layer_idx
+        std::map<int, ptr<Buffer>> mlpBiasBuffers;   // Key: layer_idx
 
         std::map<std::pair<int, int>, ptr<Texture>> neuralVQGrids;
         std::map<std::pair<int, int>, glm::ivec2> neuralVQGridShapes;

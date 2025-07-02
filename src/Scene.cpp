@@ -8,6 +8,7 @@
 #include "glm/fwd.hpp"
 #include "tiny_obj_loader.h"
 #include <complex>
+#include <cstddef>
 #include <cstdint>
 
 using namespace Mandrill;
@@ -146,7 +147,7 @@ void Scene::loadNeuralModel(const std::filesystem::path& modelPath)
         // This assumes mMaterials is already populated by addMeshFromFile
         for (auto& mat : mMaterials) {
             // Ensure mat.name is populated correctly from tinyobj::material_t::name
-            if (mNeuralModelData.materials.count(mat.name)) {
+            if (mNeuralModelData.materials.count(mat.neuralLinkName)) {
                 mat.isNeuralTexture = true;
                 mat.pCpuNeuralMaterialData = &mNeuralModelData.materials.at(mat.name);
                 mat.params.isNeuralTexture = 1; // For UBO
@@ -454,6 +455,7 @@ std::vector<uint32_t> Scene::addMeshFromFile(const std::filesystem::path& path,
     for (auto& material : materials) {
         Material mat;
         mat.params.isNeuralTexture = 0;
+        mat.name = material.name;
 
         std::string name_for_linking = material.name; // Default to original MTL name
         if (!material.diffuse_texname.empty()) {
@@ -467,9 +469,8 @@ std::vector<uint32_t> Scene::addMeshFromFile(const std::filesystem::path& path,
                 name_for_linking = derived;
             }
         }
-        mat.name = name_for_linking;
-        Log::Info("Material (original MTL: '{}', diffuse_tex: '{}') processed for linking as: '{}'", material.name,
-                  material.diffuse_texname, mat.name);
+        mat.neuralLinkName = name_for_linking;
+        Log::Info("Material (original MTL: '{}') processed for linking as: '{}'", mat.name, mat.neuralLinkName);
 
         mat.params.diffuse.r = material.diffuse[0];
         mat.params.diffuse.g = material.diffuse[1];
@@ -605,14 +606,17 @@ void executeSingleTimeCommands(Mandrill::ptr<Mandrill::Device> device, std::func
 void createPositionalEncodingData(std::vector<float>& outData)
 {
     const int TABLE_SIZE = 8;       // The data repeats over an 8-unit grid
-    const int FEATURES_PER_DIM = 5; // 3 octaves * 2 offsets - 1 skipped pair
+    const int FEATURES_PER_DIM = 6; // 3 octaves * 2 offsets - 1 skipped pair
 
     outData.resize(TABLE_SIZE * FEATURES_PER_DIM);
 
-    auto tri = [](float x, float offset) { return (2.0f * std::abs(fmod(x - offset, 2.0f) - 1.0f) - 1.0f); };
+    auto tri = [](float x, float offset) {
+        float val = x - offset;
+        // This is the C++ implementation of Python's `%` operator for floats
+        float mod_val = val - 2.0f * std::floor(val / 2.0f);
+        return (2.0f * std::abs(mod_val - 1.0f) - 1.0f);
+    };
 
-    // We loop over table positions first to create a "row-major" buffer layout.
-    // This makes shader lookups much cleaner: buffer[position * num_features + feature_index]
     for (int pos = 0; pos < TABLE_SIZE; ++pos) {
         int feature_idx = 0;
         for (int octave = 0; octave < 3; ++octave) {
@@ -628,6 +632,7 @@ void createPositionalEncodingData(std::vector<float>& outData)
                 feature_idx++;
             }
         }
+        outData[pos * FEATURES_PER_DIM + feature_idx] = 0.0f;
     }
 }
 
@@ -871,11 +876,11 @@ void Scene::compile()
                             cr.size = bufferSize;
                             vkCmdCopyBuffer(cmd, pStaging->getBuffer(), pGpuBuffer->getBuffer(), 1, &cr);
                         });
-                        mat.mlpWeightBuffers.push_back(pGpuBuffer);
-                        Log::Debug("Uploaded MLP L{} weights for '{}', {} bytes", sm_layer.layer_idx, mat.name,
-                                   bufferSize);
+                        mat.mlpWeightBuffers[sm_layer.layer_idx] = pGpuBuffer;
+                        Log::Info("Uploaded MLP L{} weights for '{}', {} bytes", sm_layer.layer_idx, mat.name,
+                                  bufferSize);
                     } else {
-                        mat.mlpWeightBuffers.push_back(nullptr); // Push null to keep indices aligned
+                        mat.mlpWeightBuffers[sm_layer.layer_idx] = nullptr;
                     }
 
                     // Bias
@@ -893,11 +898,10 @@ void Scene::compile()
                             cr.size = bufferSize;
                             vkCmdCopyBuffer(cmd, pStaging->getBuffer(), pGpuBuffer->getBuffer(), 1, &cr);
                         });
-                        mat.mlpBiasBuffers.push_back(pGpuBuffer);
-                        Log::Debug("Uploaded MLP L{} bias for '{}', {} bytes", sm_layer.layer_idx, mat.name,
-                                   bufferSize);
+                        mat.mlpBiasBuffers[sm_layer.layer_idx] = pGpuBuffer;
+                        Log::Info("Uploaded MLP L{} bias for '{}', {} bytes", sm_layer.layer_idx, mat.name, bufferSize);
                     } else {
-                        mat.mlpBiasBuffers.push_back(nullptr); // Push null to keep indices aligned
+                        mat.mlpBiasBuffers[sm_layer.layer_idx] = nullptr;
                     }
                 }
             }
@@ -1282,19 +1286,25 @@ void Scene::createDescriptors()
 
         // --- Bindings 22+: MLP Layer Buffers (Neural) ---
         // Loop up to the maximum number of layers the layout supports.
-        for (int i = 0; i < MAX_MLP_LAYERS; ++i) {
+        //
+        for (int layer_idx = 0; layer_idx < MAX_MLP_LAYERS; ++layer_idx) { // Use a non-shadowed variable
             // Bind Weights
-            // Check if this material has a buffer for layer 'i'.
-            if (i < mat.mlpWeightBuffers.size() && mat.mlpWeightBuffers[i]) {
-                desc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, mat.mlpWeightBuffers[i]);
+            auto it_w = mat.mlpWeightBuffers.find(layer_idx);
+            if (it_w != mat.mlpWeightBuffers.end() && it_w->second) {
+                // Found a valid buffer for this layer_idx, bind it.
+                desc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, it_w->second);
             } else {
+                // No buffer for this layer_idx, bind the dummy.
                 desc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, mpDummyStorageBuffer);
             }
+
             // Bind Biases
-            // Check if this material has a buffer for layer 'i'.
-            if (i < mat.mlpBiasBuffers.size() && mat.mlpBiasBuffers[i]) {
-                desc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, mat.mlpBiasBuffers[i]);
+            auto it_b = mat.mlpBiasBuffers.find(layer_idx);
+            if (it_b != mat.mlpBiasBuffers.end() && it_b->second) {
+                // Found a valid buffer for this layer_idx, bind it.
+                desc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, it_b->second);
             } else {
+                // No buffer for this layer_idx, bind the dummy.
                 desc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, mpDummyStorageBuffer);
             }
         }

@@ -1,5 +1,9 @@
 #define SAFETENSORS_CPP_IMPLEMENTATION
 #include "model_loader.h"
+#include <cmath>
+#include <cstdint>
+#include <limits>
+
 
 // Define SAFETENSORS_CPP_IMPLEMENTATION in exactly one .cc file
 // This is now handled by safetensors.hh when SAFETENSORS_CPP_IMPLEMENTATION is
@@ -23,6 +27,91 @@ MLPLayer::MLPLayer() : weights_dtype(safetensors::dtype::kFLOAT32), bias_dtype(s
 }
 SafetensorsModelData::SafetensorsModelData() : uses_vq(false), uses_combined_features(false), max_level_idx(-1)
 {
+}
+
+// Helper to convert a 16-bit float (represented as uint16_t) to a 32-bit float for printing
+float fp16_to_fp32(uint16_t half)
+{
+    uint32_t sign = (half >> 15) & 0x0001;
+    uint32_t exponent = (half >> 10) & 0x001F;
+    uint32_t mantissa = half & 0x03FF;
+
+    if (exponent == 0) {
+        if (mantissa == 0) { // Plus or minus zero
+            return sign ? -0.0f : 0.0f;
+        } else { // Denormalized number
+            while (!(mantissa & 0x0400)) {
+                mantissa <<= 1;
+                exponent--;
+            }
+            exponent++;
+            mantissa &= ~0x0400;
+            float val = std::ldexp(static_cast<float>(mantissa), -10);
+            return sign ? -val : val;
+        }
+    } else if (exponent == 31) {
+        if (mantissa == 0) { // Inf
+            return sign ? -std::numeric_limits<float>::infinity() : std::numeric_limits<float>::infinity();
+        } else { // NaN
+            return std::numeric_limits<float>::quiet_NaN();
+        }
+    }
+
+    exponent = exponent + (127 - 15);
+    mantissa = mantissa << 13;
+
+    uint32_t full_float_bits = (sign << 31) | (exponent << 23) | mantissa;
+    float result;
+    std::memcpy(&result, &full_float_bits, sizeof(float));
+    return result;
+}
+
+void transpose_hw_for_each_channel(FeatureGridData& fgd)
+{
+
+    if (fgd.shape.size() != 3) {
+        return; // Not a 3D tensor we can rotate.
+    }
+
+    size_t C = fgd.shape[0];
+    size_t H = fgd.shape[1];
+    size_t W = fgd.shape[2];
+
+    if (H == 0 || W == 0)
+        return;
+
+    // The new shape after a 90-degree rotation will have swapped H and W.
+    size_t newH = W;
+    size_t newW = H;
+
+    std::vector<uint8_t> rotated_data(fgd.data_uint8.size());
+
+    for (size_t c = 0; c < C; ++c) {
+        for (size_t h = 0; h < H; ++h) {
+            for (size_t w = 0; w < W; ++w) {
+                // Source index in the original (C, H, W) layout
+                size_t src_index = (c * H * W) + (h * W) + w;
+
+                // Destination coordinate after a 90-degree CCW rotation is (W-1-w, h)
+                size_t dest_h = W - 1 - w;
+                size_t dest_w = h;
+
+                // Destination index in the new (C, W, H) layout
+                size_t dest_index = (c * newH * newW) + (dest_h * newW) + dest_w;
+
+                rotated_data[dest_index] = fgd.data_uint8[src_index];
+            }
+        }
+    }
+
+    // Replace the old data with the newly rotated data.
+    fgd.data_uint8 = std::move(rotated_data);
+
+    // CRITICAL: Update the shape to reflect the new dimensions.
+    fgd.shape = {C, newH, newW};
+
+    std::cout << "Info: Rotated grid '" << fgd.name << "' 90-deg CCW. New shape: [" << fgd.shape[0] << ", "
+              << fgd.shape[1] << ", " << fgd.shape[2] << "]" << std::endl;
 }
 
 // --- Helper functions for parsing tensor names (same as before) ---
@@ -261,6 +350,7 @@ bool load_model_from_safetensors(const std::string& filename, SafetensorsModelDa
             FeatureGridData fgd(name);
             copy_tensor_data(fgd.data_uint8, st_data, tensor_info);
             fgd.shape = tensor_info.shape;
+            transpose_hw_for_each_channel(fgd);
             parse_feature_grid_name_details(fgd); // Parse after getting name
             model_data.named_feature_grids[name] = fgd;
 
@@ -350,6 +440,49 @@ bool load_model_from_safetensors(const std::string& filename, SafetensorsModelDa
     }
     // Note: uses_combined_features is already true if combined_feature_key_name was set.
     // If it's not set, it remains false.
+
+    for (auto& mat_pair : model_data.materials) {
+        std::sort(mat_pair.second.mlp_layers.begin(), mat_pair.second.mlp_layers.end(),
+                  [](const MLPLayer& a, const MLPLayer& b) { return a.layer_idx < b.layer_idx; });
+    }
+
+    std::cout << "\n--- CPU Bias Value Verification ---" << std::endl;
+    for (const auto& mat_pair : model_data.materials) {
+        const MaterialSpecificData& mat_data = mat_pair.second;
+        if (mat_data.mlp_layers.empty())
+            continue;
+
+        const MLPLayer& last_layer =
+            mat_data.mlp_layers.back(); // Get the last layer (e.g., Conv2d with 3 output channels)
+
+        std::cout << "Material: '" << mat_data.id << "', Last MLP Layer (idx " << last_layer.layer_idx << ") Bias: ";
+
+        if (last_layer.bias_raw_bytes.empty()) {
+            std::cout << "(no bias tensor found)" << std::endl;
+            continue;
+        }
+
+        if (last_layer.bias_dtype == safetensors::dtype::kFLOAT32) {
+            size_t num_floats = last_layer.bias_raw_bytes.size() / sizeof(float);
+            const float* bias_values = reinterpret_cast<const float*>(last_layer.bias_raw_bytes.data());
+            std::cout << "[F32] ";
+            for (size_t i = 0; i < num_floats; ++i) {
+                std::cout << std::fixed << bias_values[i] << " ";
+            }
+        } else if (last_layer.bias_dtype == safetensors::dtype::kFLOAT16) {
+            size_t num_halfs = last_layer.bias_raw_bytes.size() / sizeof(uint16_t);
+            const uint16_t* bias_raw_half_values = reinterpret_cast<const uint16_t*>(last_layer.bias_raw_bytes.data());
+            std::cout << "[F16] ";
+            for (size_t i = 0; i < num_halfs; ++i) {
+                float val = fp16_to_fp32(bias_raw_half_values[i]);
+                std::cout << std::fixed << val << " ";
+            }
+        } else {
+            std::cout << "(unsupported dtype for printing)";
+        }
+        std::cout << std::endl;
+    }
+    std::cout << "--- End CPU Bias Verification ---\n" << std::endl;
 
     print_model_data_summary(model_data);
 
