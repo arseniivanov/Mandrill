@@ -64,22 +64,22 @@ Buffer::~Buffer()
     vkDestroyBuffer(mpDevice->getDevice(), mBuffer, nullptr);
     vkFreeMemory(mpDevice->getDevice(), mMemory, nullptr);
 }
-
 void Buffer::copyFromHost(const void* pData, VkDeviceSize size, VkDeviceSize offset)
 {
-    // Check if we need a staging buffer or not
+    // This is the branch for DEVICE_LOCAL buffers that need a staging buffer.
     if (!(mProperties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
         // Set up staging buffer
         Buffer staging(mpDevice, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
-        // Copy to staging buffer
+        // Copy to staging buffer. This recursive call will take the `else` branch below.
         staging.copyFromHost(pData, size, 0);
 
-        // Transfer from staging buffer to this buffer
+        // Transfer from staging buffer to this (the final DEVICE_LOCAL) buffer
         VkCommandBuffer cmd = Helpers::cmdBegin(mpDevice);
 
         VkBufferCopy region = {
+            .srcOffset = 0, // It's good practice to specify the source offset too.
             .dstOffset = offset,
             .size = size,
         };
@@ -87,9 +87,43 @@ void Buffer::copyFromHost(const void* pData, VkDeviceSize size, VkDeviceSize off
 
         Helpers::cmdEnd(mpDevice, cmd);
 
-    } else {
-        // Transfer directly without staging buffer
+    }
+    // This is the branch for HOST_VISIBLE buffers (like your texture staging buffer).
+    else {
+
+        // --- START OF DEBUG CODE ---
+        // Check if we're dealing with the large VQ grid staging buffer by checking its unique size.
+        if (size == 753664) {
+            // Cast the incoming data pointer so we can read from it.
+            const uint8_t* sourceData = static_cast<const uint8_t*>(pData);
+
+            printf("--- PRE-MEMCPY CHECK --- First 10 bytes of source data: ");
+            for (int i = 0; i < 10; ++i) {
+                printf("%s%d", (i > 0 ? ", " : ""), static_cast<int>(sourceData[i]));
+            }
+            printf("\n");
+            fflush(stdout);
+        }
+        // --- END OF DEBUG CODE ---
+
+        // Perform the direct memory copy.
         char* pOffsettedHostMap = (char*)mpHostMap + offset;
         std::memcpy(pOffsettedHostMap, pData, size);
+
+
+        // --- OPTIONAL POST-MEMCPY CHECK ---
+        // You could add another print here to read back from pOffsettedHostMap
+        // to ensure the memcpy itself worked, but it's very unlikely to be the point of failure.
+        // The PRE-MEMCPY check is the most important one.
+        if (size == 753664) {
+            const uint8_t* destData = static_cast<const uint8_t*>(static_cast<void*>(pOffsettedHostMap));
+            printf("--- POST-MEMCPY CHECK --- First 10 bytes in mapped buffer: ");
+            for (int i = 0; i < 10; ++i) {
+                printf("%s%d", (i > 0 ? ", " : ""), static_cast<int>(destData[i]));
+            }
+            printf("\n");
+            fflush(stdout);
+        }
+        // --- END OPTIONAL CHECK ---
     }
 }

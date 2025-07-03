@@ -281,9 +281,10 @@ namespace Mandrill
         }
 
 
-        inline static void transitionImageLayout(ptr<Device> pDevice, VkImage image, VkFormat format,
-                                                 VkImageLayout oldLayout, VkImageLayout newLayout, uint32_t mipLevels,
-                                                 uint32_t arrayLayers) // New parameter
+        inline static void transitionImageLayoutArray(ptr<Device> pDevice, VkImage image, VkFormat format,
+                                                      VkImageLayout oldLayout, VkImageLayout newLayout,
+                                                      uint32_t mipLevels,
+                                                      uint32_t arrayLayers) // New parameter
         {
             VkCommandBuffer cmd = cmdBegin(pDevice);
 
@@ -450,8 +451,8 @@ namespace Mandrill
 
             VkBufferImageCopy region = {
                 .bufferOffset = 0,
-                .bufferRowLength = 0,
-                .bufferImageHeight = 0,
+                .bufferRowLength = width,
+                .bufferImageHeight = height,
                 .imageSubresource =
                     {
                         .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,

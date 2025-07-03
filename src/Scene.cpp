@@ -105,29 +105,6 @@ ptr<Node> Scene::addNode()
     return ptr<Node>(&*(mNodes.end() - 1), [](Node*) {});
 }
 
-uint32_t Scene::addMaterial(Material material)
-{
-    auto setTexture = [this](std::unordered_map<std::string, ptr<Texture>>& loadedTextures, std::string texturePath,
-                             enum MaterialTextureBit bit, ptr<Texture> pMissingTexture) {
-        if (!texturePath.empty()) {
-            addTexture(texturePath);
-        } else {
-            loadedTextures.insert(std::make_pair(texturePath, pMissingTexture));
-        }
-    };
-
-    material.params.hasTexture = 0;
-
-    setTexture(mTextures, material.diffuseTexturePath, DIFFUSE_TEXTURE_BIT, mpMissingTexture);
-    setTexture(mTextures, material.specularTexturePath, SPECULAR_TEXTURE_BIT, mpMissingTexture);
-    setTexture(mTextures, material.ambientTexturePath, AMBIENT_TEXTURE_BIT, mpMissingTexture);
-    setTexture(mTextures, material.emissionTexturePath, EMISSION_TEXTURE_BIT, mpMissingTexture);
-    setTexture(mTextures, material.normalTexturePath, NORMAL_TEXTURE_BIT, mpMissingTexture);
-
-    mMaterials.push_back(material);
-
-    return count(mMaterials) - 1;
-}
 
 void Scene::loadNeuralModel(const std::filesystem::path& modelPath)
 {
@@ -149,7 +126,7 @@ void Scene::loadNeuralModel(const std::filesystem::path& modelPath)
             // Ensure mat.name is populated correctly from tinyobj::material_t::name
             if (mNeuralModelData.materials.count(mat.neuralLinkName)) {
                 mat.isNeuralTexture = true;
-                mat.pCpuNeuralMaterialData = &mNeuralModelData.materials.at(mat.name);
+                mat.pCpuNeuralMaterialData = &mNeuralModelData.materials.at(mat.neuralLinkName);
                 mat.params.isNeuralTexture = 1; // For UBO
                 Log::Info("Linked OBJ material '{}' to neural material ID '{}'", mat.name,
                           mat.pCpuNeuralMaterialData->id);
@@ -332,6 +309,7 @@ std::vector<uint32_t> Scene::addMeshFromFile(const std::filesystem::path& path,
             Log::Error("TinyObjReader: {}", reader.Error());
         }
         Log::Error("Failed to load {}", path.string());
+        return newMeshIndices;
     }
 
     if (!reader.Warning().empty()) {
@@ -342,7 +320,76 @@ std::vector<uint32_t> Scene::addMeshFromFile(const std::filesystem::path& path,
     auto& shapes = reader.GetShapes();
     auto& materials = reader.GetMaterials();
 
-    // Loop over shapes
+    uint32_t baseMaterialIndex = count(mMaterials);
+    std::vector<uint32_t> tinyobjIndexToSceneIndexMap;
+    tinyobjIndexToSceneIndexMap.reserve(materials.size());
+
+    for (const auto& material : materials) {
+        Material mat;
+        mat.params.isNeuralTexture = 0;
+        mat.name = material.name;
+
+        // --- Derive neuralLinkName (logic is unchanged) ---
+        std::string name_for_linking = material.name;
+        if (!material.diffuse_texname.empty()) {
+            std::string derived = deriveBaseNameFromTextureFilename(material.diffuse_texname);
+            if (!derived.empty()) {
+                name_for_linking = derived;
+            }
+        } else if (!material.specular_texname.empty()) {
+            std::string derived = deriveBaseNameFromTextureFilename(material.specular_texname);
+            if (!derived.empty()) {
+                name_for_linking = derived;
+            }
+        }
+        mat.neuralLinkName = name_for_linking;
+        Log::Info("Material (original MTL: '{}') processed for linking as: '{}'", mat.name, mat.neuralLinkName);
+
+        // --- Standard material properties (logic is unchanged) ---
+        mat.params.diffuse = {material.diffuse[0], material.diffuse[1], material.diffuse[2]};
+        mat.params.specular = {material.specular[0], material.specular[1], material.specular[2]};
+        mat.params.ambient = {material.ambient[0], material.ambient[1], material.ambient[2]};
+        mat.params.emission = {material.emission[0], material.emission[1], material.emission[2]};
+        mat.params.shininess = material.shininess;
+        mat.params.indexOfRefraction = material.ior;
+        mat.params.opacity = material.dissolve;
+
+        auto setTexture = [this, path, materialPath](std::string textureName, std::string& textureKey) {
+            if (!textureName.empty()) {
+                std::replace(textureName.begin(), textureName.end(), '\\', '/');
+                auto fullPath = std::filesystem::canonical(path.parent_path() / textureName);
+                textureKey = fullPath.string();
+                addTexture(textureKey);
+                return true;
+            }
+            // For setTexture, we no longer need to pass the whole map or the missing texture.
+            // The logic in createDescriptors handles missing textures correctly.
+            return false;
+        };
+
+        mat.params.hasTexture = 0;
+        if (setTexture(material.diffuse_texname, mat.diffuseTexturePath)) {
+            mat.params.hasTexture |= DIFFUSE_TEXTURE_BIT;
+        }
+        if (setTexture(material.specular_texname, mat.specularTexturePath)) {
+            mat.params.hasTexture |= SPECULAR_TEXTURE_BIT;
+        }
+        if (setTexture(material.ambient_texname, mat.ambientTexturePath)) {
+            mat.params.hasTexture |= AMBIENT_TEXTURE_BIT;
+        }
+        if (setTexture(material.emissive_texname, mat.emissionTexturePath)) {
+            mat.params.hasTexture |= EMISSION_TEXTURE_BIT;
+        }
+        if (setTexture(material.normal_texname, mat.normalTexturePath)) {
+            mat.params.hasTexture |= NORMAL_TEXTURE_BIT;
+        }
+
+        // <<< ADDED: Store the new material and map its original index to its new global index
+        uint32_t newSceneIndex = count(mMaterials);
+        mMaterials.push_back(mat);
+        tinyobjIndexToSceneIndexMap.push_back(newSceneIndex);
+    }
+
     for (auto& shape : shapes) {
         // One mesh per material in shape
         std::set<int> matIDs;
@@ -357,7 +404,15 @@ std::vector<uint32_t> Scene::addMeshFromFile(const std::filesystem::path& path,
         std::vector<uint32_t> indices(matIDs.size(), 0);
         for (size_t f = 0; f < shape.mesh.num_face_vertices.size(); f++) {
             size_t fv = size_t(shape.mesh.num_face_vertices[f]);
-            int materialIndex = shape.mesh.material_ids[f];
+            int tinyobjMaterialIndex = shape.mesh.material_ids[f]; // This is the original index from tinyobj
+
+            // <<< MODIFIED: Handle case with no material
+            if (tinyobjMaterialIndex < 0 || tinyobjMaterialIndex >= tinyobjIndexToSceneIndexMap.size()) {
+                // This face has no material or an invalid one. Skip it or assign a default.
+                // For now, we just skip the vertices of this face.
+                indexOffset += fv;
+                continue;
+            }
 
             // Loop over vertices in the face
             for (size_t v = 0; v < fv; v++) {
@@ -379,10 +434,11 @@ std::vector<uint32_t> Scene::addMeshFromFile(const std::filesystem::path& path,
                     vert.texcoord.y = attrib.texcoords[2 * size_t(idx.texcoord_index) + 1];
                 }
 
-                auto meshIndex = std::distance(matIDs.find(materialIndex), matIDs.end()) - 1;
+                auto meshIndex = std::distance(matIDs.find(tinyobjMaterialIndex), matIDs.end()) - 1;
                 shapeMesh[meshIndex].vertices.push_back(vert);
                 shapeMesh[meshIndex].indices.push_back(indices[meshIndex]);
-                shapeMesh[meshIndex].materialIndex = count(mMaterials) + materialIndex;
+                // <<< MODIFIED: Use the map to get the correct, definitive scene material index
+                shapeMesh[meshIndex].materialIndex = tinyobjIndexToSceneIndexMap.at(tinyobjMaterialIndex);
                 indices[meshIndex] += 1;
             }
 
@@ -390,8 +446,11 @@ std::vector<uint32_t> Scene::addMeshFromFile(const std::filesystem::path& path,
         }
 
         for (auto& mesh : shapeMesh) {
-            mMeshes.push_back(mesh);
-            newMeshIndices.push_back(count(mMeshes) - 1);
+            // <<< MODIFIED: Ensure we don't add empty meshes
+            if (!mesh.vertices.empty()) {
+                mMeshes.push_back(mesh);
+                newMeshIndices.push_back(count(mMeshes) - 1);
+            }
         }
     }
 
@@ -449,84 +508,6 @@ std::vector<uint32_t> Scene::addMeshFromFile(const std::filesystem::path& path,
 
         mesh.vertices = newVertices;
         mesh.indices = newIndices;
-    }
-
-    // Load materials
-    for (auto& material : materials) {
-        Material mat;
-        mat.params.isNeuralTexture = 0;
-        mat.name = material.name;
-
-        std::string name_for_linking = material.name; // Default to original MTL name
-        if (!material.diffuse_texname.empty()) {
-            std::string derived = deriveBaseNameFromTextureFilename(material.diffuse_texname);
-            if (!derived.empty()) {
-                name_for_linking = derived;
-            }
-        } else if (!material.specular_texname.empty()) { // Fallback
-            std::string derived = deriveBaseNameFromTextureFilename(material.specular_texname);
-            if (!derived.empty()) {
-                name_for_linking = derived;
-            }
-        }
-        mat.neuralLinkName = name_for_linking;
-        Log::Info("Material (original MTL: '{}') processed for linking as: '{}'", mat.name, mat.neuralLinkName);
-
-        mat.params.diffuse.r = material.diffuse[0];
-        mat.params.diffuse.g = material.diffuse[1];
-        mat.params.diffuse.b = material.diffuse[2];
-
-        mat.params.specular.r = material.specular[0];
-        mat.params.specular.g = material.specular[1];
-        mat.params.specular.b = material.specular[2];
-
-        mat.params.ambient.r = material.ambient[0];
-        mat.params.ambient.g = material.ambient[1];
-        mat.params.ambient.b = material.ambient[2];
-
-        mat.params.emission.r = material.emission[0];
-        mat.params.emission.g = material.emission[1];
-        mat.params.emission.b = material.emission[2];
-
-        mat.params.shininess = material.shininess;
-        mat.params.indexOfRefraction = material.ior;
-        mat.params.opacity = material.dissolve;
-
-        auto setTexture = [this, path, materialPath](std::unordered_map<std::string, ptr<Texture>>& loadedTextures,
-                                                     std::string textureName, ptr<Texture> pMissingTexture,
-                                                     std::string& textureKey) {
-            if (!textureName.empty()) {
-                std::replace(textureName.begin(), textureName.end(), '\\', '/');
-
-                auto fullPath = std::filesystem::canonical(path.parent_path() / textureName);
-                textureKey = fullPath.string();
-                addTexture(textureKey);
-                return true;
-            }
-
-            loadedTextures.insert(std::make_pair(textureName, pMissingTexture));
-            return false;
-        };
-
-        mat.params.hasTexture = 0;
-
-        if (setTexture(mTextures, material.diffuse_texname, mpMissingTexture, mat.diffuseTexturePath)) {
-            mat.params.hasTexture |= DIFFUSE_TEXTURE_BIT;
-        }
-        if (setTexture(mTextures, material.specular_texname, mpMissingTexture, mat.specularTexturePath)) {
-            mat.params.hasTexture |= SPECULAR_TEXTURE_BIT;
-        }
-        if (setTexture(mTextures, material.ambient_texname, mpMissingTexture, mat.ambientTexturePath)) {
-            mat.params.hasTexture |= AMBIENT_TEXTURE_BIT;
-        }
-        if (setTexture(mTextures, material.emissive_texname, mpMissingTexture, mat.emissionTexturePath)) {
-            mat.params.hasTexture |= EMISSION_TEXTURE_BIT;
-        }
-        if (setTexture(mTextures, material.normal_texname, mpMissingTexture, mat.normalTexturePath)) {
-            mat.params.hasTexture |= NORMAL_TEXTURE_BIT;
-        }
-
-        mMaterials.push_back(mat);
     }
 
     // Add to statistics
@@ -786,7 +767,7 @@ void Scene::compile()
                     }
                 }
 
-                Log::Info("Processing neural data for material: {}", mat.name);
+                Log::Info("Processing neural data for material: {}", mat.neuralLinkName);
                 const MaterialSpecificData& specific_mat_data = *mat.pCpuNeuralMaterialData;
 
                 // --- Channel Selection Data ---
@@ -813,7 +794,7 @@ void Scene::compile()
                                 vkCmdCopyBuffer(cmd, pStaging->getBuffer(), pGpuBuffer->getBuffer(), 1, &cr);
                             });
                             mat.neuralChannelSelectionBuffers[{l, 0}] = pGpuBuffer;
-                            Log::Debug("Uploaded channel selection for '{}' L{}G0: {} indices", mat.name, l,
+                            Log::Debug("Uploaded channel selection for '{}' L{}G0: {} indices", mat.neuralLinkName, l,
                                        selections.grid0_selected_channels.size());
                         }
 
@@ -835,7 +816,7 @@ void Scene::compile()
                                 vkCmdCopyBuffer(cmd, pStaging->getBuffer(), pGpuBuffer->getBuffer(), 1, &cr);
                             });
                             mat.neuralChannelSelectionBuffers[{l, 1}] = pGpuBuffer;
-                            Log::Debug("Uploaded channel selection for '{}' L{}G1: {} indices", mat.name, l,
+                            Log::Debug("Uploaded channel selection for '{}' L{}G1: {} indices", mat.neuralLinkName, l,
                                        selections.grid1_selected_channels.size());
                         }
                         mat.params.channelCounts[l].z = 0.0;
@@ -848,8 +829,8 @@ void Scene::compile()
 
                 // --- MLP Layer Data ---
                 if (specific_mat_data.mlp_layers.size() > MAX_MLP_LAYERS) {
-                    Log::Warning("Material '{}' has {} MLP layers, but layout only supports {}. Truncating.", mat.name,
-                                 specific_mat_data.mlp_layers.size(), MAX_MLP_LAYERS);
+                    Log::Warning("Material '{}' has {} MLP layers, but layout only supports {}. Truncating.",
+                                 mat.neuralLinkName, specific_mat_data.mlp_layers.size(), MAX_MLP_LAYERS);
                 }
                 for (const MLPLayer& sm_layer : specific_mat_data.mlp_layers) {
                     if (mat.mlpWeightBuffers.size() >= MAX_MLP_LAYERS)
@@ -877,7 +858,7 @@ void Scene::compile()
                             vkCmdCopyBuffer(cmd, pStaging->getBuffer(), pGpuBuffer->getBuffer(), 1, &cr);
                         });
                         mat.mlpWeightBuffers[sm_layer.layer_idx] = pGpuBuffer;
-                        Log::Info("Uploaded MLP L{} weights for '{}', {} bytes", sm_layer.layer_idx, mat.name,
+                        Log::Info("Uploaded MLP L{} weights for '{}', {} bytes", sm_layer.layer_idx, mat.neuralLinkName,
                                   bufferSize);
                     } else {
                         mat.mlpWeightBuffers[sm_layer.layer_idx] = nullptr;
@@ -899,7 +880,8 @@ void Scene::compile()
                             vkCmdCopyBuffer(cmd, pStaging->getBuffer(), pGpuBuffer->getBuffer(), 1, &cr);
                         });
                         mat.mlpBiasBuffers[sm_layer.layer_idx] = pGpuBuffer;
-                        Log::Info("Uploaded MLP L{} bias for '{}', {} bytes", sm_layer.layer_idx, mat.name, bufferSize);
+                        Log::Info("Uploaded MLP L{} bias for '{}', {} bytes", sm_layer.layer_idx, mat.neuralLinkName,
+                                  bufferSize);
                     } else {
                         mat.mlpBiasBuffers[sm_layer.layer_idx] = nullptr;
                     }
@@ -982,8 +964,8 @@ void Scene::compile()
             params_to_copy.denormChannelCount = count;
 
             if (count > MAX_MATERIAL_CHANNELS) {
-                Log::Warning("Material '{}' has {} denorm channels, but layout only supports {}. Clamping.", mat.name,
-                             count, MAX_MATERIAL_CHANNELS);
+                Log::Warning("Material '{}' has {} denorm channels, but layout only supports {}. Clamping.",
+                             mat.neuralLinkName, count, MAX_MATERIAL_CHANNELS);
                 count = MAX_MATERIAL_CHANNELS;
             }
 
@@ -1246,11 +1228,16 @@ void Scene::createDescriptors()
 
         // --- Bindings 1-5: Standard Textures ---
         // Bind the actual texture objects to the sampler slots.
-        desc.emplace_back(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, mTextures[mat.diffuseTexturePath]);
-        desc.emplace_back(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, mTextures[mat.specularTexturePath]);
-        desc.emplace_back(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, mTextures[mat.ambientTexturePath]);
-        desc.emplace_back(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, mTextures[mat.emissionTexturePath]);
-        desc.emplace_back(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, mTextures[mat.normalTexturePath]);
+        desc.emplace_back(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                          !mat.diffuseTexturePath.empty() ? mTextures.at(mat.diffuseTexturePath) : mpMissingTexture);
+        desc.emplace_back(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                          !mat.specularTexturePath.empty() ? mTextures.at(mat.specularTexturePath) : mpMissingTexture);
+        desc.emplace_back(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                          !mat.ambientTexturePath.empty() ? mTextures.at(mat.ambientTexturePath) : mpMissingTexture);
+        desc.emplace_back(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                          !mat.emissionTexturePath.empty() ? mTextures.at(mat.emissionTexturePath) : mpMissingTexture);
+        desc.emplace_back(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                          !mat.normalTexturePath.empty() ? mTextures.at(mat.normalTexturePath) : mpMissingTexture);
 
         for (int level = 0; level < MAX_NEURAL_FEATURE_GRID_LEVELS; ++level) {
             for (int grid_type = 0; grid_type < 2; ++grid_type) {

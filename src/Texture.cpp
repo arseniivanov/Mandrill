@@ -102,6 +102,7 @@ Texture::Texture(ptr<Device> pDevice, Type type, VkFormat format, const void* pD
     : mpDevice(pDevice), mImageInfo{0}
 {
     if (type == Type::Texture2DArray) {
+        Log::Info("Calling create_array from texture of shape {} x {}", height, width);
         create_array(format, pData, width, height, depth, channels, mipmaps);
     } else {
         // All other types use the original create function
@@ -134,6 +135,9 @@ void Texture::create_array(VkFormat format, const void* pData, uint32_t width, u
     );
 
     if (pData) {
+
+        const uint8_t* byteData = static_cast<const uint8_t*>(pData);
+
         VkDeviceSize size = width * height * depth * layerCount * bytesPerPixel;
 
         Buffer staging(mpDevice, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
@@ -141,14 +145,14 @@ void Texture::create_array(VkFormat format, const void* pData, uint32_t width, u
 
         staging.copyFromHost(pData, size);
 
-        Helpers::transitionImageLayout(mpDevice, mpImage->getImage(), format, VK_IMAGE_LAYOUT_UNDEFINED,
-                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, mipLevels, layerCount);
+        Helpers::transitionImageLayoutArray(mpDevice, mpImage->getImage(), format, VK_IMAGE_LAYOUT_UNDEFINED,
+                                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, mipLevels, layerCount);
         // Use our new helper overload
         Helpers::copyBufferToImage(mpDevice, staging.getBuffer(), mpImage->getImage(), width, height, depth,
                                    layerCount);
 
-        Helpers::transitionImageLayout(mpDevice, mpImage->getImage(), format, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, mipLevels, layerCount);
+        Helpers::transitionImageLayoutArray(mpDevice, mpImage->getImage(), format, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, mipLevels, layerCount);
     }
     // Create the image view with the correct 2D_ARRAY type
     mpImage->createImageView(VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_VIEW_TYPE_2D_ARRAY);
@@ -221,8 +225,7 @@ void Texture::create(Type type, VkFormat format, const void* pData, uint32_t wid
         staging.copyFromHost(pData, size);
 
         Helpers::transitionImageLayout(mpDevice, mpImage->getImage(), format, VK_IMAGE_LAYOUT_UNDEFINED,
-                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, mipLevels,
-                                       arrayLayers); // Pass arrayLayers
+                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, mipLevels); // Pass arrayLayers
 
         Helpers::copyBufferToImage(mpDevice, staging.getBuffer(), mpImage->getImage(), width, height, depth,
                                    arrayLayers); // Pass arrayLayers
@@ -231,8 +234,7 @@ void Texture::create(Type type, VkFormat format, const void* pData, uint32_t wid
             generateMipmaps(); // Note: generateMipmaps might also need an update for arrayLayers if used
         } else {
             Helpers::transitionImageLayout(mpDevice, mpImage->getImage(), format, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, mipLevels,
-                                           arrayLayers); // Pass arrayLayers
+                                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, mipLevels); // Pass arrayLayers
         }
     }
 
