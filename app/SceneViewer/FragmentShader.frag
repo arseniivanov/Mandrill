@@ -178,7 +178,7 @@ vec4 evaluate_neural_texture(vec2 uv, float lod) {
         uvec3 grid_dims = materialParams.featureGridShapes[level_idx][0].xyz; //feature grid shape (channels, width, height)
 
         // We simulate an unfolded feature space (64x64 -> 256x256 for LOD 0)
-        vec2 conceptual_map_size = vec2(grid_dims.z, grid_dims.y) * 4.0;
+        vec2 conceptual_map_size = vec2(grid_dims.z * 4.0 - 1.0, grid_dims.y * 4.0 - 1.0);
         vec2 conceptual_coord_float = uv * conceptual_map_size;
         
         ivec2 p00_coord = ivec2(floor(conceptual_coord_float));
@@ -260,7 +260,7 @@ vec4 evaluate_neural_texture(vec2 uv, float lod) {
         uvec3 grid_dims = materialParams.featureGridShapes[level_idx][1].xyz;
 
         // 1. Calculate the continuous coordinate on the high-resolution "conceptual" map.
-        vec2 conceptual_map_size = vec2(grid_dims.z, grid_dims.y) * 4.0;
+        vec2 conceptual_map_size = vec2(grid_dims.z * 4.0 - 1.0, grid_dims.y * 4.0 - 1.0);
         vec2 conceptual_coord_float = uv * conceptual_map_size;
 
         // 2. Find the top-left integer corner (p00) and the fractional part for interpolation.
