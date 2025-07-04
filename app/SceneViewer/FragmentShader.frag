@@ -116,22 +116,30 @@ const int POS_ENCODING_TABLE_SIZE = 8;
 const int POS_ENCODING_FEATURES_PER_DIM = 6; // 3 octaves * 2 offsets - 1 skipped
 
 float get_feature_from_codebook(uint vq_index, uint feature_index) {
-    const uint bytes_per_patch = 4; // 16 features * 2 bits/feature = 32 bits = 4 bytes
-    uint byte_offset_in_patch = feature_index / 4; //
-    uint total_byte_offset = (vq_index * bytes_per_patch) + byte_offset_in_patch;
+    // 1. Get the 32-bit packed data for the entire patch.
+    uint packed_dword = vqCodebookBuffer.data[vq_index];
 
-    uint dword_index = total_byte_offset / 4;
-    uint byte_index_in_dword = total_byte_offset % 4;
-    uint packed_dword = vqCodebookBuffer.data[dword_index];
-    uint packed_byte = (packed_dword >> (byte_index_in_dword * 8)) & 0xFF;
+    // 2. Calculate the direct bit offset.
+    // Each feature is 2 bits. feature_index=0 is at bit 0, feature_index=13 is at bit 26.
+    uint bit_offset = feature_index * 2;
 
-    uint index_in_byte = feature_index % 4;
-    uint palette_index = (packed_byte >> (index_in_byte * 2)) & 0x03u;
+    // 3. Shift the entire dword right by the offset and mask the lowest 2 bits.
+    uint palette_index = (packed_dword >> bit_offset) & 0x03u; // 0x03u is binary 11
+
+    // 4. Look up the value in the palette.
     return paletteBuffer.data[palette_index];
 }
 
 int mod(int x, int m) {
     return (x % m + m) % m;
+}
+
+uint mod(int x, uint m) {
+    return (x % m + m) % m;
+}
+
+uvec2 mod(uvec2 x, uint m) {
+    return uvec2((x.x % m + m) % m, (x.y % m + m) % m);
 }
 
 void append_positional_encoding_static(inout float features[128], int base_feature_index, vec2 coords) {
@@ -180,31 +188,41 @@ vec4 evaluate_neural_texture(vec2 uv, float lod) {
         // We simulate an unfolded feature space (64x64 -> 256x256 for LOD 0)
         vec2 conceptual_map_size = vec2(grid_dims.z * 4.0 - 1.0, grid_dims.y * 4.0 - 1.0);
         vec2 conceptual_coord_float = uv * conceptual_map_size;
+
+        uint wrap_const = uint(grid_dims.z * 4);
         
-        ivec2 p00_coord = ivec2(floor(conceptual_coord_float));
+        ivec2 p00_coord = ivec2(floor(conceptual_coord_float)); //Coordinate in uncompressed (0, grid_dims) space
+        uint x = mod(p00_coord.x, wrap_const);
+        uint y = mod(p00_coord.y, wrap_const);
+        uvec2 p00_coord_wrapped = uvec2(x, y);
         vec2 frac = fract(conceptual_coord_float);
 
+        //Bilinear weights for the coordinates in the uncompressed feature space
         float w11 = frac.x * frac.y;
         float w10 = frac.x * (1.0 - frac.y);
         float w01 = (1.0 - frac.x) * frac.y;
         float w00 = (1.0 - frac.x) * (1.0 - frac.y);
         
-        ivec2 p10_coord = p00_coord + ivec2(1, 0);
-        ivec2 p01_coord = p00_coord + ivec2(0, 1);
-        ivec2 p11_coord = p00_coord + ivec2(1, 1);
+        //Coordinates in uncompressed (256,256)-space
+        uvec2 p10_coord = mod(p00_coord_wrapped + uvec2(1, 0), wrap_const);
+        uvec2 p01_coord = mod(p00_coord_wrapped + uvec2(0, 1), wrap_const);
+        uvec2 p11_coord = mod(p00_coord_wrapped + uvec2(1, 1), wrap_const);
         
-        // VQ Grid coordinates (your existing logic is fine here, but let's use your helper for consistency)
-        ivec2 grid_size = ivec2(grid_dims.z, grid_dims.y);
-        ivec2 n00 = ivec2(mod(p00_coord.x / 4, grid_size.x), mod(p00_coord.y / 4, grid_size.y));
-        ivec2 n10 = ivec2(mod(p10_coord.x / 4, grid_size.x), mod(p10_coord.y / 4, grid_size.y));
-        ivec2 n01 = ivec2(mod(p01_coord.x / 4, grid_size.x), mod(p01_coord.y / 4, grid_size.y));
-        ivec2 n11 = ivec2(mod(p11_coord.x / 4, grid_size.x), mod(p11_coord.y / 4, grid_size.y));
+        //nXX is the coordinate in the compressed 4x smaller grid. For example (0,0) to (4,4) should all map to (0,0)
+        //Coordinates in (64,64)-space
+        uvec2 grid_size = uvec2(grid_dims.z, grid_dims.y);
 
-        uint idx00 = uint(mod(p00_coord.y, 4)) * 4 + uint(mod(p00_coord.x, 4));
-        uint idx10 = uint(mod(p10_coord.y, 4)) * 4 + uint(mod(p10_coord.x, 4));
-        uint idx01 = uint(mod(p01_coord.y, 4)) * 4 + uint(mod(p01_coord.x, 4));
-        uint idx11 = uint(mod(p11_coord.y, 4)) * 4 + uint(mod(p11_coord.x, 4));
-        
+        uvec2 n00 = uvec2(uint(p00_coord_wrapped.x / 4.0) % grid_size.x, uint(p00_coord_wrapped.y / 4.0) % grid_size.y);
+        uvec2 n10 = uvec2(uint(p10_coord.x / 4.0) % grid_size.x,         uint(p10_coord.y / 4.0) % grid_size.y);
+        uvec2 n01 = uvec2(uint(p01_coord.x / 4.0) % grid_size.x,         uint(p01_coord.y / 4.0) % grid_size.y);
+        uvec2 n11 = uvec2(uint(p11_coord.x / 4.0) % grid_size.x,         uint(p11_coord.y / 4.0) % grid_size.y);
+
+        //Coordinates in the (4x4) codebook
+        uint idx00 = (p00_coord_wrapped.y % 4u) * 4u + (p00_coord_wrapped.x % 4u);
+        uint idx10 = (p10_coord.y % 4u) * 4u + (p10_coord.x % 4u);
+        uint idx01 = (p01_coord.y % 4u) * 4u + (p01_coord.x % 4u);
+        uint idx11 = (p11_coord.y % 4u) * 4u + (p11_coord.x % 4u);
+
         uint vq_idx_00; 
         uint vq_idx_10; 
         uint vq_idx_01; 
@@ -401,6 +419,11 @@ vec4 evaluate_neural_texture(vec2 uv, float lod) {
         }
     }
 
+
+    if (distance(vec2(0.0,0.0), uv) < 0.02){
+        final_color = vec4(1.0,0.0,1.0,1.0);
+        return final_color;
+      }
     // Return the calculated color
     return final_color; 
 }
