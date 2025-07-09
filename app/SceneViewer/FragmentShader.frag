@@ -113,7 +113,7 @@ layout(set = 3, binding = 3) readonly buffer PositionalEncodingBuffer { float da
 // =========================================================================
 
 const int POS_ENCODING_TABLE_SIZE = 8;
-const int POS_ENCODING_FEATURES_PER_DIM = 6; // 3 octaves * 2 offsets - 1 skipped
+const int POS_ENCODING_FEATURES_PER_DIM = 6; // 3 octaves * 2 offsets
 
 float get_feature_from_codebook(uint vq_index, uint feature_index) {
     // 1. Get the 32-bit packed data for the entire patch.
@@ -132,14 +132,6 @@ float get_feature_from_codebook(uint vq_index, uint feature_index) {
 
 int mod(int x, int m) {
     return (x % m + m) % m;
-}
-
-uint mod(int x, uint m) {
-    return (x % m + m) % m;
-}
-
-uvec2 mod(uvec2 x, uint m) {
-    return uvec2((x.x % m + m) % m, (x.y % m + m) % m);
 }
 
 void append_positional_encoding_static(inout float features[128], int base_feature_index, vec2 coords) {
@@ -178,6 +170,8 @@ vec4 evaluate_neural_texture(vec2 uv, float lod) {
     float features[MAX_TOTAL_FEATURES];
     int feature_count = 0;
     
+    vec2 python_uv = vec2(uv.x, 1.0 - uv.y);
+    vec2 absolute_coords = python_uv * RESOLUTION;
     vec2 frac_coords;
 
     // --- 2. Grid 0 Feature Gathering (4 scaled features per channel) ---
@@ -186,16 +180,12 @@ vec4 evaluate_neural_texture(vec2 uv, float lod) {
         uvec3 grid_dims = materialParams.featureGridShapes[level_idx][0].xyz; //feature grid shape (channels, width, height)
 
         // We simulate an unfolded feature space (64x64 -> 256x256 for LOD 0)
-        vec2 conceptual_map_size = vec2(grid_dims.z * 4.0 - 1.0, grid_dims.y * 4.0 - 1.0);
-        vec2 conceptual_coord_float = uv * conceptual_map_size;
+        uvec2 conceptual_map_size = uvec2(grid_dims.z * 4u, grid_dims.y * 4u);
 
-        uint wrap_const = uint(grid_dims.z * 4);
+        vec2 python_space_float_coord = python_uv * (vec2(conceptual_map_size) - 1);
         
-        ivec2 p00_coord = ivec2(floor(conceptual_coord_float)); //Coordinate in uncompressed (0, grid_dims) space
-        uint x = mod(p00_coord.x, wrap_const);
-        uint y = mod(p00_coord.y, wrap_const);
-        uvec2 p00_coord_wrapped = uvec2(x, y);
-        vec2 frac = fract(conceptual_coord_float);
+        ivec2 unwrapped_p00_coord = ivec2(floor(python_space_float_coord)); //Coordinate in uncompressed (0, grid_dims) space
+        vec2 frac = fract(python_space_float_coord);
 
         //Bilinear weights for the coordinates in the uncompressed feature space
         float w11 = frac.x * frac.y;
@@ -203,30 +193,31 @@ vec4 evaluate_neural_texture(vec2 uv, float lod) {
         float w01 = (1.0 - frac.x) * frac.y;
         float w00 = (1.0 - frac.x) * (1.0 - frac.y);
         
-        //Coordinates in uncompressed (256,256)-space
-        uvec2 p10_coord = mod(p00_coord_wrapped + uvec2(1, 0), wrap_const);
-        uvec2 p01_coord = mod(p00_coord_wrapped + uvec2(0, 1), wrap_const);
-        uvec2 p11_coord = mod(p00_coord_wrapped + uvec2(1, 1), wrap_const);
-        
-        //nXX is the coordinate in the compressed 4x smaller grid. For example (0,0) to (4,4) should all map to (0,0)
-        //Coordinates in (64,64)-space
-        uvec2 grid_size = uvec2(grid_dims.z, grid_dims.y);
+        //Wrapped coordinates in uncompressed (256,256)-space
+        ivec2 unwrapped_p10_coord = unwrapped_p00_coord + ivec2(1, 0);
+        ivec2 unwrapped_p01_coord = unwrapped_p00_coord + ivec2(0, 1);
+        ivec2 unwrapped_p11_coord = unwrapped_p00_coord + ivec2(1, 1);
 
-        uvec2 n00 = uvec2(uint(p00_coord_wrapped.x / 4.0) % grid_size.x, uint(p00_coord_wrapped.y / 4.0) % grid_size.y);
-        uvec2 n10 = uvec2(uint(p10_coord.x / 4.0) % grid_size.x,         uint(p10_coord.y / 4.0) % grid_size.y);
-        uvec2 n01 = uvec2(uint(p01_coord.x / 4.0) % grid_size.x,         uint(p01_coord.y / 4.0) % grid_size.y);
-        uvec2 n11 = uvec2(uint(p11_coord.x / 4.0) % grid_size.x,         uint(p11_coord.y / 4.0) % grid_size.y);
+        uvec2 p00_coord = uvec2(unwrapped_p00_coord) % conceptual_map_size;
+        uvec2 p10_coord = uvec2(unwrapped_p10_coord) % conceptual_map_size;
+        uvec2 p01_coord = uvec2(unwrapped_p01_coord) % conceptual_map_size;
+        uvec2 p11_coord = uvec2(unwrapped_p11_coord) % conceptual_map_size;
 
-        //Coordinates in the (4x4) codebook
-        uint idx00 = (p00_coord_wrapped.y % 4u) * 4u + (p00_coord_wrapped.x % 4u);
-        uint idx10 = (p10_coord.y % 4u) * 4u + (p10_coord.x % 4u);
-        uint idx01 = (p01_coord.y % 4u) * 4u + (p01_coord.x % 4u);
-        uint idx11 = (p11_coord.y % 4u) * 4u + (p11_coord.x % 4u);
+        uint idx00 = (p00_coord.x % 4u) * 4u + (p00_coord.y % 4u);
+        uint idx10 = (p10_coord.x % 4u) * 4u + (p10_coord.y % 4u);
+        uint idx01 = (p01_coord.x % 4u) * 4u + (p01_coord.y % 4u);
+        uint idx11 = (p11_coord.x % 4u) * 4u + (p11_coord.y % 4u);
+
+        uvec2 n00 = uvec2(p00_coord.y / 4u, p00_coord.x / 4u);
+        uvec2 n10 = uvec2(p10_coord.y / 4u, p10_coord.x / 4u);
+        uvec2 n01 = uvec2(p01_coord.y / 4u, p01_coord.x / 4u);
+        uvec2 n11 = uvec2(p11_coord.y / 4u, p11_coord.x / 4u);
 
         uint vq_idx_00; 
         uint vq_idx_10; 
         uint vq_idx_01; 
         uint vq_idx_11; 
+
 
         for (int i = 0; i < num_selections_g0; ++i) {
             uint channel_to_sample;
@@ -262,49 +253,56 @@ vec4 evaluate_neural_texture(vec2 uv, float lod) {
             }
 
             float f00 = get_feature_from_codebook(vq_idx_00, idx00);
-            float f01 = get_feature_from_codebook(vq_idx_01, idx01);
             float f10 = get_feature_from_codebook(vq_idx_10, idx10);
+            float f01 = get_feature_from_codebook(vq_idx_01, idx01);
             float f11 = get_feature_from_codebook(vq_idx_11, idx11);
 
             features[feature_count++] = f00 * w00;
             features[feature_count++] = f01 * w01;
             features[feature_count++] = f10 * w10;
             features[feature_count++] = f11 * w11;
+            //features[feature_count++] = 0.0f;
+            //features[feature_count++] = 0.0f;
+            //features[feature_count++] = 0.0f;
+            //features[feature_count++] = 0.0f;
         }
     }
 
     uint num_selections_g1 = materialParams.channelCounts[level_idx].y;
     if (num_selections_g1 > 0) {
         uvec3 grid_dims = materialParams.featureGridShapes[level_idx][1].xyz;
+        uvec2 conceptual_map_size = uvec2(grid_dims.z * 4u, grid_dims.y * 4u);
 
-        // 1. Calculate the continuous coordinate on the high-resolution "conceptual" map.
-        vec2 conceptual_map_size = vec2(grid_dims.z * 4.0 - 1.0, grid_dims.y * 4.0 - 1.0);
-        vec2 conceptual_coord_float = uv * conceptual_map_size;
-
-        // 2. Find the top-left integer corner (p00) and the fractional part for interpolation.
-        ivec2 p00_coord = ivec2(floor(conceptual_coord_float));
-        vec2 frac = fract(conceptual_coord_float);
-
-        // Define the other 3 corner points in the conceptual map space.
-        ivec2 p10_coord = p00_coord + ivec2(1, 0);
-        ivec2 p01_coord = p00_coord + ivec2(0, 1);
-        ivec2 p11_coord = p00_coord + ivec2(1, 1);
+        // 1. Convert to Python's top-left coordinate system. This is the key first step.
+        vec2 python_space_float_coord = python_uv * vec2(conceptual_map_size);
         
-        // VQ Grid coordinates (your existing logic is fine here, but let's use your helper for consistency)
-        ivec2 grid_size = ivec2(grid_dims.z, grid_dims.y);
-        ivec2 n00 = ivec2(mod(p00_coord.x / 4, grid_size.x), mod(p00_coord.y / 4, grid_size.y));
-        ivec2 n10 = ivec2(mod(p10_coord.x / 4, grid_size.x), mod(p10_coord.y / 4, grid_size.y));
-        ivec2 n01 = ivec2(mod(p01_coord.x / 4, grid_size.x), mod(p01_coord.y / 4, grid_size.y));
-        ivec2 n11 = ivec2(mod(p11_coord.x / 4, grid_size.x), mod(p11_coord.y / 4, grid_size.y));
+        // 2. Get the base coordinate and fractional part for interpolation.
+        ivec2 unwrapped_p00_coord = ivec2(floor(python_space_float_coord));
+        vec2 frac = fract(python_space_float_coord);
 
-        uint idx00 = uint(mod(p00_coord.y, 4)) * 4 + uint(mod(p00_coord.x, 4));
-        uint idx10 = uint(mod(p10_coord.y, 4)) * 4 + uint(mod(p10_coord.x, 4));
-        uint idx01 = uint(mod(p01_coord.y, 4)) * 4 + uint(mod(p01_coord.x, 4));
-        uint idx11 = uint(mod(p11_coord.y, 4)) * 4 + uint(mod(p11_coord.x, 4));
+        // 4. Find all four neighbors in the unwrapped space BEFORE applying the modulus.
+        ivec2 unwrapped_p10_coord = unwrapped_p00_coord + ivec2(1, 0);
+        ivec2 unwrapped_p01_coord = unwrapped_p00_coord + ivec2(0, 1);
+        ivec2 unwrapped_p11_coord = unwrapped_p00_coord + ivec2(1, 1);
 
-        // Keep your VQ index variables.
+        // 5. Apply wrapping to each coordinate individually.
+        uvec2 p00_coord = uvec2(unwrapped_p00_coord) % conceptual_map_size;
+        uvec2 p10_coord = uvec2(unwrapped_p10_coord) % conceptual_map_size;
+        uvec2 p01_coord = uvec2(unwrapped_p01_coord) % conceptual_map_size;
+        uvec2 p11_coord = uvec2(unwrapped_p11_coord) % conceptual_map_size;
+
+        uint idx00 = (p00_coord.x % 4u) * 4u + (p00_coord.y % 4u);
+        uint idx10 = (p10_coord.x % 4u) * 4u + (p10_coord.y % 4u);
+        uint idx01 = (p01_coord.x % 4u) * 4u + (p01_coord.y % 4u);
+        uint idx11 = (p11_coord.x % 4u) * 4u + (p11_coord.y % 4u);
+
+        uvec2 n00 = uvec2(p00_coord.y / 4u, p00_coord.x / 4u);
+        uvec2 n10 = uvec2(p10_coord.y / 4u, p10_coord.x / 4u);
+        uvec2 n01 = uvec2(p01_coord.y / 4u, p01_coord.x / 4u);
+        uvec2 n11 = uvec2(p11_coord.y / 4u, p11_coord.x / 4u);
+
         uint vq_idx_00, vq_idx_10, vq_idx_01, vq_idx_11;
-        
+            
         for (int i = 0; i < num_selections_g1; ++i) {
             uint channel_to_sample;
             switch(level_idx) {
@@ -350,12 +348,14 @@ vec4 evaluate_neural_texture(vec2 uv, float lod) {
             features[feature_count++] = final_feature;
         }
     }
-    //TODO insert padding with 0s between last feature and the positional encoding for different LODS
+    //TODO insert padding with 0s between last feature and the LOD for different LODS
+    //TODO normalize LODS
 
-    vec2 absolute_coords = uv * RESOLUTION;
+    //Hardcoded normalizied LOD0 
+    features[feature_count++] = -1.0f;
+
     append_positional_encoding_static(features, feature_count, absolute_coords);
     feature_count += 12;
-    features[feature_count++] = lod;
 
     // --- 5. MLP ---
     const float LEAKY_RELU_SLOPE = 0.01;
@@ -420,7 +420,7 @@ vec4 evaluate_neural_texture(vec2 uv, float lod) {
     }
 
 
-    if (distance(vec2(0.0,0.0), uv) < 0.02){
+    if (distance(vec2(0.0,0.0), python_uv) < 0.02){
         final_color = vec4(1.0,0.0,1.0,1.0);
         return final_color;
       }

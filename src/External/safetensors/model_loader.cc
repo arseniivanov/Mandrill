@@ -264,9 +264,9 @@ bool load_model_from_safetensors(const std::string& filename, SafetensorsModelDa
             size_t num_elements = raw_palette_data.size() / sizeof(float);
             model_data.palette.values.resize(num_elements);
             std::memcpy(model_data.palette.values.data(), raw_palette_data.data(), raw_palette_data.size());
-        } else if (name == "vq_codebook_patches_packed_uint8") {
-            if (tensor_info.dtype != safetensors::dtype::kUINT8) {
-                std::cerr << "Error: VQ Codebook tensor '" << name << "' has unexpected dtype. Expected U8."
+        } else if (name == "vq_codebook_patches_packed_uint32") {
+            if (tensor_info.dtype != safetensors::dtype::kUINT32) {
+                std::cerr << "Error: VQ Codebook tensor '" << name << "' has unexpected dtype. Expected U32."
                           << std::endl;
                 continue;
             }
@@ -350,7 +350,7 @@ bool load_model_from_safetensors(const std::string& filename, SafetensorsModelDa
             FeatureGridData fgd(name);
             copy_tensor_data(fgd.data_uint8, st_data, tensor_info);
             fgd.shape = tensor_info.shape;
-            transpose_hw_for_each_channel(fgd);
+            // transpose_hw_for_each_channel(fgd);
             parse_feature_grid_name_details(fgd); // Parse after getting name
             model_data.named_feature_grids[name] = fgd;
 
