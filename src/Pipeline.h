@@ -95,7 +95,7 @@ namespace Mandrill
         /// </summary>
         /// <param name="cmd">Command buffer to use</param>
         /// <returns></returns>
-        MANDRILL_API void bind(VkCommandBuffer cmd);
+        MANDRILL_API void bind(VkCommandBuffer cmd) const;
 
         /// <summary>
         /// Recreate a pipeline. Call this if shader source code has changed and should be reloaded.

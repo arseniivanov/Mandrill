@@ -8,4 +8,6 @@ target_sources(SceneViewer
 add_shaders(SceneViewer
 	"VertexShader.vert"
 	"FragmentShader.frag"
+	"FragmentShader_VQ.frag"
+  "FragmentShader_Raw.frag"
 )

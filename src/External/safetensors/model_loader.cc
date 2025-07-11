@@ -66,54 +66,6 @@ float fp16_to_fp32(uint16_t half)
     return result;
 }
 
-void transpose_hw_for_each_channel(FeatureGridData& fgd)
-{
-
-    if (fgd.shape.size() != 3) {
-        return; // Not a 3D tensor we can rotate.
-    }
-
-    size_t C = fgd.shape[0];
-    size_t H = fgd.shape[1];
-    size_t W = fgd.shape[2];
-
-    if (H == 0 || W == 0)
-        return;
-
-    // The new shape after a 90-degree rotation will have swapped H and W.
-    size_t newH = W;
-    size_t newW = H;
-
-    std::vector<uint8_t> rotated_data(fgd.data_uint8.size());
-
-    for (size_t c = 0; c < C; ++c) {
-        for (size_t h = 0; h < H; ++h) {
-            for (size_t w = 0; w < W; ++w) {
-                // Source index in the original (C, H, W) layout
-                size_t src_index = (c * H * W) + (h * W) + w;
-
-                // Destination coordinate after a 90-degree CCW rotation is (W-1-w, h)
-                size_t dest_h = W - 1 - w;
-                size_t dest_w = h;
-
-                // Destination index in the new (C, W, H) layout
-                size_t dest_index = (c * newH * newW) + (dest_h * newW) + dest_w;
-
-                rotated_data[dest_index] = fgd.data_uint8[src_index];
-            }
-        }
-    }
-
-    // Replace the old data with the newly rotated data.
-    fgd.data_uint8 = std::move(rotated_data);
-
-    // CRITICAL: Update the shape to reflect the new dimensions.
-    fgd.shape = {C, newH, newW};
-
-    std::cout << "Info: Rotated grid '" << fgd.name << "' 90-deg CCW. New shape: [" << fgd.shape[0] << ", "
-              << fgd.shape[1] << ", " << fgd.shape[2] << "]" << std::endl;
-}
-
 // --- Helper functions for parsing tensor names (same as before) ---
 bool parse_denorm_tensor_name(const std::string& name, std::string& material_id, bool& is_mean)
 {
@@ -250,6 +202,14 @@ bool load_model_from_safetensors(const std::string& filename, SafetensorsModelDa
             continue;
         }
 
+        static const std::regex vq_grid_regex("([a-zA-Z0-9_\\.\\-]+)_level_(\\d+)_grid_(\\d+)_vq_indices_uint8");
+        static const std::regex raw_packed_grid_regex(
+            "packed_feature_grid_([a-zA-Z0-9_\\.\\-]+)_L(\\d+)_G(\\d+)_uint32");
+        static const std::regex raw_packed_grid_dims_regex(
+            "packed_feature_grid_([a-zA-Z0-9_\\.\\-]+)_L(\\d+)_G(\\d+)_uint32_dims");
+
+        std::smatch match;
+
         if (name == "vq_codebook_palette_float32") {
             if (tensor_info.dtype != safetensors::dtype::kFLOAT32) {
                 std::cerr << "Error: Palette tensor '" << name << "' has unexpected dtype. Expected F32." << std::endl;
@@ -268,11 +228,50 @@ bool load_model_from_safetensors(const std::string& filename, SafetensorsModelDa
             if (tensor_info.dtype != safetensors::dtype::kUINT32) {
                 std::cerr << "Error: VQ Codebook tensor '" << name << "' has unexpected dtype. Expected U32."
                           << std::endl;
+                model_data.uses_vq = true; // Set flag when codebook is found
                 continue;
             }
             copy_tensor_data(model_data.vq_codebook.packed_data, st_data, tensor_info);
             model_data.vq_codebook.shape = tensor_info.shape;
             model_data.uses_vq = true;
+        } else if (std::regex_match(name, match, raw_packed_grid_regex)) {
+            model_data.uses_vq = false; // This is a non-VQ model
+
+            // Construct a consistent name to use as a map key
+            std::string grid_map_key = "packed_L" + match[2].str() + "_G" + match[3].str();
+
+            FeatureGridData& fgd = model_data.named_feature_grids[grid_map_key];
+            if (fgd.name.empty()) {
+                fgd.name = grid_map_key;
+                fgd.base_feature_key = match[1].str();
+                fgd.level_idx = std::stoi(match[2].str());
+                fgd.grid_type = std::stoi(match[3].str());
+            }
+
+            copy_tensor_data(fgd.raw_data_bytes, st_data, tensor_info);
+            fgd.shape = tensor_info.shape; // Shape of the packed uint32 data
+        }
+        // --- Packed Raw Dimensions Handling ---
+        else if (std::regex_match(name, match, raw_packed_grid_dims_regex)) {
+            model_data.uses_vq = false; // This is a non-VQ model
+
+            std::string grid_map_key = "packed_L" + match[2].str() + "_G" + match[3].str();
+            FeatureGridData& fgd = model_data.named_feature_grids[grid_map_key];
+            if (fgd.name.empty()) {
+                fgd.name = grid_map_key;
+                fgd.base_feature_key = match[1].str();
+                fgd.level_idx = std::stoi(match[2].str());
+                fgd.grid_type = std::stoi(match[3].str());
+            }
+
+            std::vector<uint8_t> dims_bytes;
+            copy_tensor_data(dims_bytes, st_data, tensor_info);
+            if (dims_bytes.size() == 3 * sizeof(int32_t)) {
+                const int32_t* dims_ptr = reinterpret_cast<const int32_t*>(dims_bytes.data());
+                fgd.original_dims.assign(dims_ptr, dims_ptr + 3);
+            } else {
+                std::cerr << "Error: Dimensions tensor '" << name << "' has incorrect size." << std::endl;
+            }
         } else if (name.rfind("mlp_", 0) == 0) { // Starts with "mlp_"
             std::string material_id_mlp;
             int layer_idx_mlp;
@@ -348,9 +347,8 @@ bool load_model_from_safetensors(const std::string& filename, SafetensorsModelDa
                 continue;
             }
             FeatureGridData fgd(name);
-            copy_tensor_data(fgd.data_uint8, st_data, tensor_info);
+            copy_tensor_data(fgd.raw_data_bytes, st_data, tensor_info);
             fgd.shape = tensor_info.shape;
-            // transpose_hw_for_each_channel(fgd);
             parse_feature_grid_name_details(fgd); // Parse after getting name
             model_data.named_feature_grids[name] = fgd;
 
@@ -517,7 +515,7 @@ void print_model_data_summary(const SafetensorsModelData& data)
         std::cout << "  - Name: " << fgd.name << ", Shape: [";
         for (size_t i = 0; i < fgd.shape.size(); ++i)
             std::cout << fgd.shape[i] << (i == fgd.shape.size() - 1 ? "" : ", ");
-        std::cout << "], Data size: " << fgd.data_uint8.size() << " bytes" << std::endl;
+        std::cout << "], Data size: " << fgd.raw_data_bytes.size() << " bytes" << std::endl;
         std::cout << "    Parsed: base_key='" << fgd.base_feature_key << "', L=" << fgd.level_idx
                   << ", G=" << fgd.grid_type << ", ch=" << fgd.channel_idx << std::endl;
     }

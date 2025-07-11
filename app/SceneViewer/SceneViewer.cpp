@@ -41,10 +41,12 @@ public:
                 Log::Warning("Neural model path not set and auto-detection failed for: {}", autoNeuralPath.string());
             }
         }
+        mpScene->setNeuralPipelines(mpVqPipeline, mpNonVqPipeline);
 
         // Add a node to the scene
         std::shared_ptr<Node> pNode = mpScene->addNode();
         pNode->setPipeline(mPipelines[PIPELINE_FILL]);
+        pNode->setNeuralPipelines(mpVqPipeline, mpNonVqPipeline);
 
         // Add all the meshes to the node
         for (auto meshIndex : meshIndices) {
@@ -70,34 +72,61 @@ public:
         mpSwapchain = std::make_shared<Swapchain>(mpDevice, 2);
 
         // Create a scene so we can access the layout, the actual scene will be loaded later
-        mpScene = std::make_shared<Scene>(mpDevice, mpSwapchain);
-        auto pLayout = mpScene->getLayout();
+        auto pTempScene = std::make_shared<Scene>(mpDevice, mpSwapchain);
 
-        // Create a pass with 1 color attachment, depth attachment and multisampling
-        mpPass = std::make_shared<Pass>(mpDevice, mpSwapchain->getExtent(), mpSwapchain->getImageFormat(), 1, true,
-                                        mpDevice->getSampleCount());
 
-        // Add push constant to layout so we can set render mode in shader
+        auto pStandardLayout = pTempScene->getLayout(false, false); // for non-neural
+        auto pVqLayout = pTempScene->getLayout(true, true);         // for neural VQ
+        auto pNonVqLayout = pTempScene->getLayout(true, false);     // for neural non-VQ
+                                                                    //
         VkPushConstantRange pushConstantRange = {
             .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
             .offset = 0,
             .size = sizeof(PushConstants),
         };
-        pLayout->addPushConstantRange(pushConstantRange);
 
-        // Create a shader module with vertex and fragment shader
-        std::vector<ShaderDesc> shaderDesc;
-        shaderDesc.emplace_back("SceneViewer/VertexShader.vert", "main", VK_SHADER_STAGE_VERTEX_BIT);
-        shaderDesc.emplace_back("SceneViewer/FragmentShader.frag", "main", VK_SHADER_STAGE_FRAGMENT_BIT);
-        std::shared_ptr<Shader> pShader = std::make_shared<Shader>(mpDevice, shaderDesc);
+        pStandardLayout->addPushConstantRange(pushConstantRange);
+        pVqLayout->addPushConstantRange(pushConstantRange);
+        pNonVqLayout->addPushConstantRange(pushConstantRange);
 
-        // Create a pipeline filled polygon rendering
-        mPipelines.emplace_back(std::make_shared<Pipeline>(mpDevice, mpPass, pLayout, pShader));
+        mpScene = nullptr;
+        // Create a pass with 1 color attachment, depth attachment and multisampling
+        mpPass = std::make_shared<Pass>(mpDevice, mpSwapchain->getExtent(), mpSwapchain->getImageFormat(), 1, true,
+                                        mpDevice->getSampleCount());
+        std::vector<ShaderDesc> standardShaderDesc;
+        standardShaderDesc.emplace_back("SceneViewer/VertexShader.vert", "main", VK_SHADER_STAGE_VERTEX_BIT);
+        standardShaderDesc.emplace_back("SceneViewer/FragmentShader.frag", "main", VK_SHADER_STAGE_FRAGMENT_BIT);
+        std::shared_ptr<Shader> pStandardShader = std::make_shared<Shader>(mpDevice, standardShaderDesc);
 
-        // Create a pipeline for line rendering
-        PipelineDesc pipelineDesc;
-        pipelineDesc.polygonMode = VK_POLYGON_MODE_LINE;
-        mPipelines.emplace_back(std::make_shared<Pipeline>(mpDevice, mpPass, pLayout, pShader, pipelineDesc));
+        // VQ Neural Shader
+        std::vector<ShaderDesc> vqShaderDesc;
+        vqShaderDesc.emplace_back("SceneViewer/VertexShader.vert", "main", VK_SHADER_STAGE_VERTEX_BIT);
+        vqShaderDesc.emplace_back("SceneViewer/FragmentShader_VQ.frag", "main",
+                                  VK_SHADER_STAGE_FRAGMENT_BIT); // Rename your existing frag shader
+        std::shared_ptr<Shader> pVqShader = std::make_shared<Shader>(mpDevice, vqShaderDesc);
+
+        // Raw Packed Neural Shader
+        std::vector<ShaderDesc> rawShaderDesc;
+        rawShaderDesc.emplace_back("SceneViewer/VertexShader.vert", "main", VK_SHADER_STAGE_VERTEX_BIT);
+        rawShaderDesc.emplace_back("SceneViewer/FragmentShader_Raw.frag", "main",
+                                   VK_SHADER_STAGE_FRAGMENT_BIT); // The NEW frag shader
+        std::shared_ptr<Shader> pRawShader = std::make_shared<Shader>(mpDevice, rawShaderDesc);
+
+        mPipelines.clear(); // Ensure it's empty before we start
+
+        // Create pipeline for standard filled rendering
+        mPipelines.emplace_back(std::make_shared<Pipeline>(mpDevice, mpPass, pStandardLayout, pStandardShader));
+
+        // Create a pipeline for standard line rendering
+        PipelineDesc linePipelineDesc;
+        linePipelineDesc.polygonMode = VK_POLYGON_MODE_LINE;
+        mPipelines.emplace_back(
+            std::make_shared<Pipeline>(mpDevice, mpPass, pStandardLayout, pStandardShader, linePipelineDesc));
+
+        // Create the two neural pipelines
+        PipelineDesc neuralPipelineDesc; // Use default fill settings
+        mpVqPipeline = std::make_shared<Pipeline>(mpDevice, mpPass, pVqLayout, pVqShader, neuralPipelineDesc);
+        mpNonVqPipeline = std::make_shared<Pipeline>(mpDevice, mpPass, pNonVqLayout, pRawShader, neuralPipelineDesc);
 
         // Setup camera
         mpCamera = std::make_shared<Camera>(mpDevice, mpWindow, mpSwapchain);
@@ -126,6 +155,15 @@ public:
 
     void render() override
     {
+        if (!mpScene) {
+            // If no scene is loaded, just clear the screen and draw the GUI
+            VkCommandBuffer cmd = mpSwapchain->acquireNextImage();
+            mpPass->begin(cmd, glm::vec4(0.0f, 0.0f, 0.0f, 1.0f));
+            App::renderGUI(cmd); // Still draw the GUI so we can load a scene
+            mpPass->end(cmd);
+            mpSwapchain->present(cmd, mpPass->getOutput());
+            return; // Don't do any scene rendering
+        }
         // Check if camera matrix and attachments need to be updated
         if (mpSwapchain->recreated()) {
             mpCamera->updateAspectRatio();
@@ -136,15 +174,21 @@ public:
         VkCommandBuffer cmd = mpSwapchain->acquireNextImage();
         mpPass->begin(cmd, glm::vec4(0.0f, 0.0f, 0.0f, 1.0f));
 
+        ptr<Pipeline> pActiveFillPipeline = mPipelines[PIPELINE_FILL];
+        if (mRenderMode == 9 && mpScene->hasNeuralModel()) { // 9 is NTC render mode
+            pActiveFillPipeline = mpScene->getActiveNeuralPipeline();
+        }
+        // Push constants for the fill/neural render.
         PushConstants pushConstants = {
             .renderMode = mRenderMode,
             .discardOnZeroAlpha = mDiscardOnZeroAlpha,
-            .lod = 0.0, // TODO FIX Adjust
+            .lod = 0.0,
         };
-        vkCmdPushConstants(cmd, mPipelines[PIPELINE_FILL]->getLayout(), VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-                           sizeof pushConstants, &pushConstants);
+        // Use the layout from the pipeline we are about to use.
+        vkCmdPushConstants(cmd, pActiveFillPipeline->getLayout(), VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pushConstants,
+                           &pushConstants);
 
-        // Render scene
+        // Render scene with the selected pipeline.
         mpScene->render(cmd, mpCamera);
 
         // Render lines
@@ -299,6 +343,8 @@ private:
     std::shared_ptr<Swapchain> mpSwapchain;
     std::shared_ptr<Pass> mpPass;
     std::vector<std::shared_ptr<Pipeline>> mPipelines;
+    ptr<Pipeline> mpVqPipeline;
+    ptr<Pipeline> mpNonVqPipeline;
 
     std::shared_ptr<Camera> mpCamera;
     float mCameraMoveSpeed = 1.0f;

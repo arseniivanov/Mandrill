@@ -217,10 +217,18 @@ namespace Mandrill
             return mMeshIndices;
         }
 
+        MANDRILL_API void setNeuralPipelines(ptr<Pipeline> pVqPipeline, ptr<Pipeline> pNonVqPipeline)
+        {
+            mpVqPipeline = pVqPipeline;
+            mpNonVqPipeline = pNonVqPipeline;
+        }
+
     private:
         friend Scene;
 
         ptr<Pipeline> mpPipeline;
+        ptr<Pipeline> mpVqPipeline;    // For VQ-based neural rendering
+        ptr<Pipeline> mpNonVqPipeline; // For Raw Packed neural rendering
 
         std::vector<uint32_t> mMeshIndices;
 
@@ -391,7 +399,9 @@ namespace Mandrill
         ///
         /// </summary>
         /// <returns>Pointer to layout</returns>
+        ///
         MANDRILL_API ptr<Layout> getLayout();
+        MANDRILL_API ptr<Layout> getLayout(bool neural, bool vq);
 
         MANDRILL_API void loadNeuralModel(const std::filesystem::path& modelPath);
         /// <summary>
@@ -517,9 +527,25 @@ namespace Mandrill
             mpEnvironmentMap = pTexture;
         }
 
-        MANDRILL_API bool hasNeuralModel()
+        MANDRILL_API bool hasNeuralModel() const
         {
             return mHasNeuralModel;
+        }
+
+        MANDRILL_API void setNeuralPipelines(ptr<Pipeline> pVqPipeline, ptr<Pipeline> pNonVqPipeline)
+        {
+            mpVqPipeline = pVqPipeline;
+            mpNonVqPipeline = pNonVqPipeline;
+        }
+
+        MANDRILL_API ptr<Pipeline> getActiveNeuralPipeline() const
+        {
+            if (mHasNeuralModel && mNeuralModelData.uses_vq) {
+                return mpVqPipeline;
+            } else if (mHasNeuralModel && !mNeuralModelData.uses_vq) {
+                return mpNonVqPipeline;
+            }
+            return nullptr; // No active neural pipeline
         }
 
     private:
@@ -530,11 +556,19 @@ namespace Mandrill
         std::filesystem::path mNeuralModelPath;
         ptr<Sampler> m_pLastSetSamplerInScene;
 
+        ptr<Layout> mpStandardLayout;
+        ptr<Layout> mpVqNeuralLayout;
+        ptr<Layout> mpNonVqNeuralLayout;
+
+        ptr<Pipeline> mpVqPipeline;
+        ptr<Pipeline> mpNonVqPipeline;
+
         ptr<Buffer> mpPaletteBuffer;
         ptr<Buffer> mpVQCodebookBuffer; // For "vq_codebook_patches_packed_uint8"
         ptr<Buffer> mpPositionalEncodingBuffer;
-        std::map<std::pair<int, int>, ptr<Texture>> mSharedVQIndexTextures; // Key: {level_idx, grid_type}
-        std::map<std::pair<int, int>, glm::ivec2> mSharedVQIndexShapes;     // Key: {level_idx, grid_type}
+        std::map<std::pair<int, int>, ptr<Texture>> mSharedVQIndexTextures;     // Key: {level_idx, grid_type}
+        std::map<std::pair<int, int>, ptr<Buffer>> mSharedPackedRawGridBuffers; // NON-VQ buffer
+        std::map<std::pair<int, int>, glm::ivec2> mSharedVQIndexShapes;         // Key: {level_idx, grid_type}
         std::unordered_map<std::pair<int, int>, glm::uvec4, pair_hash> mSharedVQIndexOriginalShapes;
         ptr<Buffer> mpDummyStorageBuffer;
 

@@ -36,7 +36,7 @@ Pipeline::~Pipeline()
     vkDestroyPipelineLayout(mpDevice->getDevice(), mPipelineLayout, nullptr);
 }
 
-void Pipeline::bind(VkCommandBuffer cmd)
+void Pipeline::bind(VkCommandBuffer cmd) const
 {
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, mPipeline);
 

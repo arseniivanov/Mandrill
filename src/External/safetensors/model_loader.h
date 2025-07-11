@@ -28,8 +28,10 @@ struct VQCodebook {
 
 struct FeatureGridData {
     std::string name;
-    std::vector<uint8_t> data_uint8;
+    std::vector<uint8_t> raw_data_bytes;
     std::vector<size_t> shape;
+
+    std::vector<int> original_dims;
 
     int level_idx = -1;
     int grid_type = -1; // 0 for G0, 1 for G1

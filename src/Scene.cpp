@@ -32,45 +32,63 @@ Node::~Node()
 {
 }
 
+// REPLACE the existing Node::render function with this:
 void Node::render(VkCommandBuffer cmd, const ptr<Camera> pCamera, const ptr<const Scene> pScene) const
 {
-    if (!mVisible || !mpPipeline) {
+    if (!mVisible) {
         return;
     }
 
     std::memcpy(mpTransformDevice + pScene->mpSwapchain->getInFlightIndex(), &mTransform, sizeof(glm::mat4));
 
-    mpPipeline->bind(cmd);
-
-    // Bind descriptor set for camera matrices, node transform, and environment map
-    VkDeviceSize alignment = pScene->mpDevice->getProperties().physicalDevice.limits.minUniformBufferOffsetAlignment;
-    uint32_t cameraDescriptorOffset = static_cast<uint32_t>(Helpers::alignTo(sizeof(CameraMatrices), alignment) *
-                                                            pScene->mpSwapchain->getInFlightIndex());
-    pCamera->getDescriptor()->bind(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, mpPipeline->getLayout(), 0,
-                                   cameraDescriptorOffset);
-
-    uint32_t nodeDescriptorOffset =
-        static_cast<uint32_t>(Helpers::alignTo(sizeof(glm::mat4), alignment) * pScene->mpSwapchain->getInFlightIndex());
-    pDescriptor->bind(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, mpPipeline->getLayout(), 1, nodeDescriptorOffset);
-
-    if (pScene->mpEnvironmentMapDescriptor) {
-        pScene->mpEnvironmentMapDescriptor->bind(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, mpPipeline->getLayout(), 3);
-    }
+    VkPipelineLayout lastBoundLayout = VK_NULL_HANDLE;
 
     for (auto meshIndex : mMeshIndices) {
         const Mesh& mesh = pScene->mMeshes[meshIndex];
+        const Material& material = pScene->mMaterials[mesh.materialIndex];
 
-        // Bind descriptor set for material
-        pScene->mMaterials[mesh.materialIndex].pDescriptor->bind(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                                                 mpPipeline->getLayout(), 2);
+        // 1. Select the correct pipeline for this mesh's material
+        ptr<const Pipeline> pCurrentPipeline = mpPipeline; // Use mpPipeline as the default/standard pipeline
+        if (material.isNeuralTexture && pScene->hasNeuralModel()) {
+            pCurrentPipeline = pScene->mNeuralModelData.uses_vq ? mpVqPipeline : mpNonVqPipeline;
+        }
 
-        // Bind vertex and index buffers
+        if (!pCurrentPipeline) {
+            Log::Warning("Node::render - Skipping mesh {} because no suitable pipeline is set.", meshIndex);
+            continue;
+        }
+
+        VkPipelineLayout currentLayout = pCurrentPipeline->getLayout();
+
+        // 2. If pipeline (and layout) has changed, bind it and the global descriptor sets
+        if (currentLayout != lastBoundLayout) {
+            pCurrentPipeline->bind(cmd);
+
+            VkDeviceSize alignment =
+                pScene->mpDevice->getProperties().physicalDevice.limits.minUniformBufferOffsetAlignment;
+            uint32_t cameraDescriptorOffset = static_cast<uint32_t>(
+                Helpers::alignTo(sizeof(CameraMatrices), alignment) * pScene->mpSwapchain->getInFlightIndex());
+            pCamera->getDescriptor()->bind(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, currentLayout, 0,
+                                           cameraDescriptorOffset);
+
+            uint32_t nodeDescriptorOffset = static_cast<uint32_t>(Helpers::alignTo(sizeof(glm::mat4), alignment) *
+                                                                  pScene->mpSwapchain->getInFlightIndex());
+            pDescriptor->bind(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, currentLayout, 1, nodeDescriptorOffset);
+
+            if (pScene->mpEnvironmentMapDescriptor) {
+                pScene->mpEnvironmentMapDescriptor->bind(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, currentLayout, 3);
+            }
+            lastBoundLayout = currentLayout;
+        }
+
+        // 3. Bind the material-specific descriptor set
+        material.pDescriptor->bind(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, currentLayout, 2);
+
+        // 4. Bind vertex/index buffers and draw
         std::array<VkBuffer, 1> vertexBuffers = {pScene->mpVertexBuffer->getBuffer()};
         std::array<VkDeviceSize, 1> offsets = {mesh.deviceVerticesOffset};
         vkCmdBindVertexBuffers(cmd, 0, count(vertexBuffers), vertexBuffers.data(), offsets.data());
         vkCmdBindIndexBuffer(cmd, pScene->mpIndexBuffer->getBuffer(), mesh.deviceIndicesOffset, VK_INDEX_TYPE_UINT32);
-
-        // Draw mesh
         vkCmdDrawIndexed(cmd, count(mesh.indices), 1, 0, 0, 0);
     }
 }
@@ -685,8 +703,48 @@ void Scene::compile()
             } else {
                 Log::Warning("Neural model data: VQ enabled, but VQ Codebook packed_data is empty.");
             }
-        }
+        } else {
+            Log::Info("Compiling neural data for Packed Raw Feature model...");
+            for (const auto& fg_pair : mNeuralModelData.named_feature_grids) {
+                const FeatureGridData& fgd = fg_pair.second;
 
+                // We only care about grids with original_dims, which indicates they are our packed raw grids.
+                if (fgd.original_dims.empty())
+                    continue;
+
+                std::pair<int, int> gridKey = {fgd.level_idx, fgd.grid_type};
+                if (fgd.level_idx != -1 && fgd.grid_type != -1 &&
+                    mSharedPackedRawGridBuffers.find(gridKey) == mSharedPackedRawGridBuffers.end()) {
+
+                    if (!fgd.raw_data_bytes.empty()) {
+                        VkDeviceSize bufferSize = fgd.raw_data_bytes.size();
+
+                        // Create a GPU buffer for this packed grid
+                        ptr<Buffer> pGridBuffer = make_ptr<Buffer>(
+                            mpDevice, bufferSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+                        // Stage and copy the data
+                        ptr<Buffer> pStagingBuffer = make_ptr<Buffer>(
+                            mpDevice, bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                        pStagingBuffer->copyFromHost(fgd.raw_data_bytes.data(), bufferSize, 0);
+                        executeSingleTimeCommands(mpDevice, [&](VkCommandBuffer cmd) {
+                            VkBufferCopy copyRegion{};
+                            copyRegion.size = bufferSize;
+                            vkCmdCopyBuffer(cmd, pStagingBuffer->getBuffer(), pGridBuffer->getBuffer(), 1, &copyRegion);
+                        });
+
+                        mSharedPackedRawGridBuffers[gridKey] = pGridBuffer;
+                        Log::Info("Created SHARED Packed Raw Grid Buffer L{}G{}, {} bytes.", fgd.level_idx,
+                                  fgd.grid_type, bufferSize);
+
+                    } else {
+                        Log::Warning("Packed Raw Grid L{}G{} has empty data. Skipping.", fgd.level_idx, fgd.grid_type);
+                    }
+                }
+            }
+        }
         // SHARED VQ Index Grid Textures
         if (mNeuralModelData.uses_vq && mNeuralModelData.uses_combined_features) {
             const std::string& sharedGridsBaseKey = mNeuralModelData.combined_feature_key_name;
@@ -713,13 +771,13 @@ void Scene::compile()
                                 uint32_t total_height = height * channels;
                                 size_t expected_size = static_cast<size_t>(width) * total_height;
 
-                                if (width > 0 && height > 0 && channels > 0 && !fgd.data_uint8.empty() &&
-                                    fgd.data_uint8.size() == expected_size) {
+                                if (width > 0 && height > 0 && channels > 0 && !fgd.raw_data_bytes.empty() &&
+                                    fgd.raw_data_bytes.size() == expected_size) {
 
                                     // Create the flattened 2D texture
                                     ptr<Texture> pGridTexture =
                                         make_ptr<Texture>(mpDevice, Texture::Type::Texture2DArray, VK_FORMAT_R8_UINT,
-                                                          fgd.data_uint8.data(), width, height, channels, 1, false);
+                                                          fgd.raw_data_bytes.data(), width, height, channels, 1, false);
 
                                     if (m_pLastSetSamplerInScene) {
                                         pGridTexture->setSampler(m_pLastSetSamplerInScene);
@@ -739,7 +797,7 @@ void Scene::compile()
                                     Log::Warning("SHARED VQ Index Grid L{}G{} (key '{}') invalid dims/data. Name: {}. "
                                                  "Skipping. Got shape [{}, {}, {}], expected size {}, got {}",
                                                  fgd.level_idx, fgd.grid_type, sharedGridsBaseKey, fgd.name, channels,
-                                                 height, width, expected_size, fgd.data_uint8.size());
+                                                 height, width, expected_size, fgd.raw_data_bytes.size());
                                 }
                             } else {
                                 Log::Warning("SHARED VQ Index Grid L{}G{} (key '{}') does not have 3 dimensions. Shape "
@@ -759,10 +817,30 @@ void Scene::compile()
                 for (int l = 0; l < MAX_NEURAL_FEATURE_GRID_LEVELS; ++l) {
                     for (int g = 0; g < 2; ++g) {
                         auto key = std::make_pair(l, g);
-                        if (mSharedVQIndexOriginalShapes.count(key)) {
-                            mat.params.featureGridShapes[l][g] = mSharedVQIndexOriginalShapes[key];
+                        if (mNeuralModelData.uses_vq) {
+                            // VQ Path: Use the shape of the VQ index texture
+                            if (mSharedVQIndexOriginalShapes.count(key)) {
+                                mat.params.featureGridShapes[l][g] = mSharedVQIndexOriginalShapes.at(key);
+                            } else {
+                                mat.params.featureGridShapes[l][g] = glm::uvec4(0);
+                            }
                         } else {
-                            mat.params.featureGridShapes[l][g] = glm::uvec4(0, 0, 0, 0); // Default to zero if not found
+                            // Non-VQ Path: Use the original_dims from the loaded packed grid data
+                            std::string grid_map_key = "packed_L" + std::to_string(l) + "_G" + std::to_string(g);
+                            if (mNeuralModelData.named_feature_grids.count(grid_map_key)) {
+                                const auto& fgd = mNeuralModelData.named_feature_grids.at(grid_map_key);
+                                if (fgd.original_dims.size() == 3) {
+                                    mat.params.featureGridShapes[l][g] = glm::uvec4(fgd.original_dims[0], // C
+                                                                                    fgd.original_dims[1], // H
+                                                                                    fgd.original_dims[2], // W
+                                                                                    0                     // Unused
+                                    );
+                                } else {
+                                    mat.params.featureGridShapes[l][g] = glm::uvec4(0);
+                                }
+                            } else {
+                                mat.params.featureGridShapes[l][g] = glm::uvec4(0);
+                            }
                         }
                     }
                 }
@@ -1101,6 +1179,12 @@ void Scene::setSampler(const ptr<Sampler> pSampler)
 
 ptr<Layout> Scene::getLayout()
 {
+    return getLayout(false, false);
+}
+
+ptr<Layout> Scene::getLayout(bool forNeural, bool forVqModel)
+
+{
     std::vector<LayoutDesc> desc;
 
     // 0.0: Camera matrices
@@ -1122,10 +1206,41 @@ ptr<Layout> Scene::getLayout()
     desc.emplace_back(2, 4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_ALL_GRAPHICS);
     desc.emplace_back(2, 5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_ALL_GRAPHICS);
 
+    if (!forNeural) {
+        // This is a standard pipeline, no neural bindings.
+        desc.emplace_back(3, 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                          VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_MISS_BIT_KHR | VK_SHADER_STAGE_FRAGMENT_BIT);
+        if (mSupportRayTracing) {
+            // 4.0: Acceleration structure
+            // 4.1: Scene vertex buffer
+            // 4.2: Scene index buffer
+            // 4.3: Scene material buffer
+            // 4.4: Scene texture array
+            // 4.5: Instance data buffer
+            // 5.0: Output storage image
+            desc.emplace_back(4, 0, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, VK_SHADER_STAGE_RAYGEN_BIT_KHR);
+            desc.emplace_back(4, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR);
+            desc.emplace_back(4, 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR);
+            desc.emplace_back(4, 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR);
+            desc.emplace_back(4, 4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR,
+                              count(mTextures));
+            desc.emplace_back(4, 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR);
+            desc.emplace_back(5, 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_SHADER_STAGE_ALL);
+        }
+        return make_ptr<Layout>(mpDevice, desc);
+    }
+
     uint32_t currentBinding = 6;
     // 2.6 - 2.13: Neural VQ Grids (usampler2D)
     for (int i = 0; i < MAX_NEURAL_FEATURE_GRID_LEVELS * 2; ++i) {
-        desc.emplace_back(2, currentBinding++, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT);
+        if (forVqModel) {
+            // VQ models expect textures (samplers)
+            desc.emplace_back(2, currentBinding++, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                              VK_SHADER_STAGE_FRAGMENT_BIT);
+        } else {
+            // Non-VQ models expect raw data buffers (SSBOs)
+            desc.emplace_back(2, currentBinding++, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT);
+        }
     }
 
     // 2.14 - 2.21: Neural Channel Selection Lists (SSBOs)
@@ -1152,23 +1267,6 @@ ptr<Layout> Scene::getLayout()
     // 3.3: Neural Positional Encoding Buffer (SSBO) // <<< ADD THIS LINE
     desc.emplace_back(3, 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT);
 
-    if (mSupportRayTracing) {
-        // 4.0: Acceleration structure
-        // 4.1: Scene vertex buffer
-        // 4.2: Scene index buffer
-        // 4.3: Scene material buffer
-        // 4.4: Scene texture array
-        // 4.5: Instance data buffer
-        // 5.0: Output storage image
-        desc.emplace_back(4, 0, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, VK_SHADER_STAGE_RAYGEN_BIT_KHR);
-        desc.emplace_back(4, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR);
-        desc.emplace_back(4, 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR);
-        desc.emplace_back(4, 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR);
-        desc.emplace_back(4, 4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR,
-                          count(mTextures));
-        desc.emplace_back(4, 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR);
-        desc.emplace_back(5, 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_SHADER_STAGE_ALL);
-    }
 
     return make_ptr<Layout>(mpDevice, desc);
 }
@@ -1189,45 +1287,47 @@ void Scene::addTexture(std::string texturePath)
 
 void Scene::createDescriptors()
 {
-    ptr<Layout> pLayout = getLayout();
 
-    // Node transforms
+    mpStandardLayout = getLayout(false, false);
+    if (mHasNeuralModel) {
+        mpVqNeuralLayout = getLayout(true, true);
+        mpNonVqNeuralLayout = getLayout(true, false);
+    }
+
+    // Part B: Create Descriptors for Nodes (Set 1)
+    // All layouts share the same structure for Set 1, so we can use the standard one.
+    VkDescriptorSetLayout nodeLayout = mpStandardLayout->getDescriptorSetLayouts()[1];
     VkDeviceSize offset = 0;
     for (auto& node : mNodes) {
         std::vector<DescriptorDesc> desc;
         desc.emplace_back(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, mpTransforms);
         desc.back().range = sizeof(glm::mat4);
         desc.back().offset = offset;
-
         offset += Helpers::alignTo(sizeof(glm::mat4),
                                    mpDevice->getProperties().physicalDevice.limits.minUniformBufferOffsetAlignment) *
                   mpSwapchain->getFramesInFlightCount();
-
-        // Set layout for set 1
-        auto layout = pLayout->getDescriptorSetLayouts()[1];
-        node.pDescriptor = std::make_unique<Descriptor>(mpDevice, desc, layout);
+        node.pDescriptor = std::make_unique<Descriptor>(mpDevice, desc, nodeLayout);
     }
 
-    // =========================================================================
-    // Part B: Create Descriptors for Materials (Set 2)
-    // =========================================================================
-    // This is the most complex part. Each material gets its own descriptor set
-    // which holds all of its parameters, textures, and neural data buffers.
+    // Part C: Create Descriptors for Materials (Set 2)
     VkDeviceSize alignment = mpDevice->getProperties().physicalDevice.limits.minUniformBufferOffsetAlignment;
     VkDeviceSize alignedSize = Helpers::alignTo(sizeof(MaterialParams), alignment);
     for (uint32_t i = 0; i < mMaterials.size(); ++i) {
         auto& mat = mMaterials[i];
-        std::vector<DescriptorDesc> desc; // Start a new list of bindings for this material.
+        std::vector<DescriptorDesc> desc;
 
-        // --- Binding 0: Material UBO ---
-        // Point to the shared UBO buffer for all material parameters.
+        // Determine which layout to use for this specific material
+        ptr<Layout> pMaterialLayout;
+        if (mat.isNeuralTexture && mHasNeuralModel) {
+            pMaterialLayout = mNeuralModelData.uses_vq ? mpVqNeuralLayout : mpNonVqNeuralLayout;
+        } else {
+            pMaterialLayout = mpStandardLayout;
+        }
+
+        // --- Bindings 0-5: Common Data (UBO, Standard Textures) ---
         desc.emplace_back(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, mpMaterialParams);
-        // Specify that this material's data is at a specific offset within that large buffer.
         desc.back().offset = i * alignedSize;
         desc.back().range = sizeof(MaterialParams);
-
-        // --- Bindings 1-5: Standard Textures ---
-        // Bind the actual texture objects to the sampler slots.
         desc.emplace_back(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                           !mat.diffuseTexturePath.empty() ? mTextures.at(mat.diffuseTexturePath) : mpMissingTexture);
         desc.emplace_back(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
@@ -1239,107 +1339,71 @@ void Scene::createDescriptors()
         desc.emplace_back(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                           !mat.normalTexturePath.empty() ? mTextures.at(mat.normalTexturePath) : mpMissingTexture);
 
-        for (int level = 0; level < MAX_NEURAL_FEATURE_GRID_LEVELS; ++level) {
-            for (int grid_type = 0; grid_type < 2; ++grid_type) {
-                auto key = std::make_pair(level, grid_type);
-
-                // Check if a SHARED texture exists for this slot.
-                if (mHasNeuralModel && mSharedVQIndexTextures.count(key) && mSharedVQIndexTextures.at(key)) {
-                    // It does, so bind the real VQ grid texture from the scene's map.
-                    desc.emplace_back(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, mSharedVQIndexTextures.at(key));
-                } else {
-                    // It does not.
-                    // We MUST bind something to satisfy the layout, so we bind a default "missing" texture.
-                    desc.emplace_back(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, mpMissingTexture);
+        // --- Bindings 6+: Neural Data (if applicable) ---
+        if (mat.isNeuralTexture && mHasNeuralModel) {
+            // Bindings 6-13: Neural grid features (Either Textures for VQ or Buffers for Raw)
+            for (int level = 0; level < MAX_NEURAL_FEATURE_GRID_LEVELS; ++level) {
+                for (int grid_type = 0; grid_type < 2; ++grid_type) {
+                    auto key = std::make_pair(level, grid_type);
+                    if (mNeuralModelData.uses_vq) {
+                        if (mSharedVQIndexTextures.count(key) && mSharedVQIndexTextures.at(key))
+                            desc.emplace_back(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                              mSharedVQIndexTextures.at(key));
+                        else
+                            desc.emplace_back(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, mpMissingTexture);
+                    } else {
+                        if (mSharedPackedRawGridBuffers.count(key) && mSharedPackedRawGridBuffers.at(key))
+                            desc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, mSharedPackedRawGridBuffers.at(key));
+                        else
+                            desc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, mpDummyStorageBuffer);
+                    }
                 }
             }
-        }
-
-        // --- Bindings 14-21: Channel Selection SSBOs (Neural) ---
-        // Same logic as above, but for the channel selection buffers.
-        for (int level = 0; level < MAX_NEURAL_FEATURE_GRID_LEVELS; ++level) {
-            for (int grid_type = 0; grid_type < 2; ++grid_type) {
-                auto key = std::make_pair(level, grid_type);
-                // Check if this material has a real buffer for this slot.
-                if (mat.neuralChannelSelectionBuffers.count(key) && mat.neuralChannelSelectionBuffers[key]) {
-                    // Bind the real SSBO containing the list of channel indices.
-                    desc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, mat.neuralChannelSelectionBuffers[key]);
-                } else {
-                    // No list for this slot. Bind the small, valid "dummy" SSBO.
+            // Bindings 14-21: Channel Selection SSBOs
+            for (int level = 0; level < MAX_NEURAL_FEATURE_GRID_LEVELS; ++level) {
+                for (int grid_type = 0; grid_type < 2; ++grid_type) {
+                    auto key = std::make_pair(level, grid_type);
+                    if (mat.neuralChannelSelectionBuffers.count(key) && mat.neuralChannelSelectionBuffers.at(key))
+                        desc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, mat.neuralChannelSelectionBuffers.at(key));
+                    else
+                        desc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, mpDummyStorageBuffer);
+                }
+            }
+            // Bindings 22+: MLP Layer Buffers
+            for (int layer_idx = 0; layer_idx < MAX_MLP_LAYERS; ++layer_idx) {
+                if (mat.mlpWeightBuffers.count(layer_idx) && mat.mlpWeightBuffers.at(layer_idx))
+                    desc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, mat.mlpWeightBuffers.at(layer_idx));
+                else
                     desc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, mpDummyStorageBuffer);
-                }
+                if (mat.mlpBiasBuffers.count(layer_idx) && mat.mlpBiasBuffers.at(layer_idx))
+                    desc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, mat.mlpBiasBuffers.at(layer_idx));
+                else
+                    desc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, mpDummyStorageBuffer);
             }
         }
 
-        // --- Bindings 22+: MLP Layer Buffers (Neural) ---
-        // Loop up to the maximum number of layers the layout supports.
-        //
-        for (int layer_idx = 0; layer_idx < MAX_MLP_LAYERS; ++layer_idx) { // Use a non-shadowed variable
-            // Bind Weights
-            auto it_w = mat.mlpWeightBuffers.find(layer_idx);
-            if (it_w != mat.mlpWeightBuffers.end() && it_w->second) {
-                // Found a valid buffer for this layer_idx, bind it.
-                desc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, it_w->second);
-            } else {
-                // No buffer for this layer_idx, bind the dummy.
-                desc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, mpDummyStorageBuffer);
-            }
-
-            // Bind Biases
-            auto it_b = mat.mlpBiasBuffers.find(layer_idx);
-            if (it_b != mat.mlpBiasBuffers.end() && it_b->second) {
-                // Found a valid buffer for this layer_idx, bind it.
-                desc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, it_b->second);
-            } else {
-                // No buffer for this layer_idx, bind the dummy.
-                desc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, mpDummyStorageBuffer);
-            }
-        }
-
-        // Finally, get the layout for Set 2 and create the descriptor object for this material.
-        auto layout = pLayout->getDescriptorSetLayouts()[2];
-        mat.pDescriptor = std::make_unique<Descriptor>(mpDevice, desc, layout);
+        auto materialDescSetLayout = pMaterialLayout->getDescriptorSetLayouts()[2];
+        mat.pDescriptor = std::make_unique<Descriptor>(mpDevice, desc, materialDescSetLayout);
     }
 
-    // =========================================================================
-    // Part C: Create Global Descriptors (Set 3)
-    // =========================================================================
-    // These are resources shared by ALL materials, like the environment map
-    // and the global neural data (palette, codebook).
+    // Part D: Create Global Descriptors (Set 3)
+    ptr<Layout> pGlobalLayout = mHasNeuralModel ? mpVqNeuralLayout : mpStandardLayout;
     std::vector<DescriptorDesc> globalDesc;
-
-    // --- Binding 0: Environment Map ---
-    if (mpEnvironmentMap) {
-        globalDesc.emplace_back(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, mpEnvironmentMap);
-    } else {
-        globalDesc.emplace_back(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, mpMissingTexture);
+    globalDesc.emplace_back(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                            mpEnvironmentMap ? mpEnvironmentMap : mpMissingTexture);
+    if (mHasNeuralModel) {
+        globalDesc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                mpPaletteBuffer ? mpPaletteBuffer : mpDummyStorageBuffer);
+        globalDesc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, (mpVQCodebookBuffer && mNeuralModelData.uses_vq)
+                                                                       ? mpVQCodebookBuffer
+                                                                       : mpDummyStorageBuffer);
+        globalDesc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                mpPositionalEncodingBuffer ? mpPositionalEncodingBuffer : mpDummyStorageBuffer);
     }
 
-    // --- Binding 1: Neural Palette ---
-    if (mHasNeuralModel && mpPaletteBuffer) {
-        globalDesc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, mpPaletteBuffer);
-    } else {
-        globalDesc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, mpDummyStorageBuffer);
-    }
-
-    // --- Binding 2: Neural VQ Codebook ---
-    if (mHasNeuralModel && mpVQCodebookBuffer) {
-        globalDesc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, mpVQCodebookBuffer);
-    } else {
-        globalDesc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, mpDummyStorageBuffer);
-    }
-    // --- Binding 3: Neural Positional Encoding --- // <<< ADD THIS BLOCK
-    if (mHasNeuralModel && mpPositionalEncodingBuffer) {
-        globalDesc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, mpPositionalEncodingBuffer);
-    } else {
-        globalDesc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, mpDummyStorageBuffer);
-    }
-
-    // Get the layout for Set 3 and create the single descriptor object for these global resources.
-    auto layoutSet3 = pLayout->getDescriptorSetLayouts()[3];
+    auto layoutSet3 = pGlobalLayout->getDescriptorSetLayouts()[3];
     mpEnvironmentMapDescriptor = std::make_unique<Descriptor>(mpDevice, globalDesc, layoutSet3);
-    Log::Info("Created descriptors Successfully.");
-
+    Log::Info("Created descriptors successfully.");
     // Add extra descriptors for ray tracing (set 4)
     if (mSupportRayTracing) {
         std::vector<DescriptorDesc> desc;
@@ -1357,7 +1421,7 @@ void Scene::createDescriptors()
         desc.emplace_back(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, pTextures, 0, 0, count(textures));
         desc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, mpInstanceDataBuffer);
 
-        auto layout = pLayout->getDescriptorSetLayouts()[4];
+        auto layout = mpStandardLayout->getDescriptorSetLayouts()[4];
         mpRayTracingDescriptor = std::make_unique<Descriptor>(mpDevice, desc, layout);
     }
 }
