@@ -27,7 +27,7 @@ Camera::Camera(ptr<Device> pDevice, GLFWwindow* pWindow, ptr<Swapchain> pSwapcha
     mFov = 30.0f;
     mNear = 0.01f;
     mFar = 1000.0f;
-    mMoveSpeed = 1.0f;
+    mMoveSpeed = 90.0f;
 
     mpUniforms = std::make_shared<Buffer>(mpDevice, mpSwapchain->getFramesInFlightCount() * sizeof(CameraMatrices),
                                           VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,

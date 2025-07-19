@@ -134,7 +134,8 @@ float get_feature_from_packed_grid(uint channel_idx, uvec2 coords, int level_idx
     }
 
     // 1. Calculate the linear index in the conceptual 3D grid
-    uint linear_2bit_index = (channel_idx * H * W) + (coords.x * H) + coords.y;
+    uint linear_2bit_index = (channel_idx * H * W) + (coords.y * W) + coords.x; //correct res wrong alignment
+    //uint linear_2bit_index = (channel_idx * H * W) + (coords.x * H) + coords.y; //correct alignment wrong res
     
     // 2. Find which uint32 in the buffer holds this value
     uint dword_index = linear_2bit_index / 16;
@@ -199,7 +200,7 @@ vec4 evaluate_neural_texture(vec2 uv, float lod) {
     float features[MAX_TOTAL_FEATURES];
     int feature_count = 0;
     
-    vec2 python_uv = vec2(uv.x, 1.0 - uv.y);
+    vec2 python_uv = vec2(1.0 - uv.y, uv.x);
     vec2 absolute_coords = python_uv * RESOLUTION;
     vec2 frac_coords;
 
@@ -207,7 +208,7 @@ vec4 evaluate_neural_texture(vec2 uv, float lod) {
     uint num_selections_g0 = materialParams.channelCounts[level_idx].x;
     if (num_selections_g0 > 0) {
         uvec2 grid_dims = materialParams.featureGridShapes[level_idx][0].yz; //feature grid shape (channels, width, height)
-        vec2 grid_float_coord = python_uv * (vec2(grid_dims) - 1.0f);
+        vec2 grid_float_coord = python_uv * (vec2(grid_dims));
 
         ivec2 p00_int_coord = ivec2(floor(grid_float_coord));
         vec2 frac = fract(grid_float_coord);

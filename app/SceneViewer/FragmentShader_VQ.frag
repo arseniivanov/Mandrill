@@ -170,9 +170,9 @@ vec4 evaluate_neural_texture(vec2 uv, float lod) {
     float features[MAX_TOTAL_FEATURES];
     int feature_count = 0;
     
-    vec2 python_uv = vec2(uv.x, 1.0 - uv.y);
+    vec2 python_uv = vec2(1.0 - uv.y, uv.x);
+    //vec2 python_uv = vec2(uv.x, 1.0 - uv.y);
     vec2 absolute_coords = python_uv * RESOLUTION;
-    vec2 frac_coords;
 
     // --- 2. Grid 0 Feature Gathering (4 scaled features per channel) ---
     uint num_selections_g0 = materialParams.channelCounts[level_idx].x;
@@ -182,7 +182,7 @@ vec4 evaluate_neural_texture(vec2 uv, float lod) {
         // We simulate an unfolded feature space (64x64 -> 256x256 for LOD 0)
         uvec2 conceptual_map_size = uvec2(grid_dims.z * 4u, grid_dims.y * 4u);
 
-        vec2 python_space_float_coord = python_uv * (vec2(conceptual_map_size) - 1);
+        vec2 python_space_float_coord = python_uv * (vec2(conceptual_map_size));
         
         ivec2 unwrapped_p00_coord = ivec2(floor(python_space_float_coord)); //Coordinate in uncompressed (0, grid_dims) space
         vec2 frac = fract(python_space_float_coord);
@@ -203,15 +203,15 @@ vec4 evaluate_neural_texture(vec2 uv, float lod) {
         uvec2 p01_coord = uvec2(unwrapped_p01_coord) % conceptual_map_size;
         uvec2 p11_coord = uvec2(unwrapped_p11_coord) % conceptual_map_size;
 
-        uint idx00 = (p00_coord.x % 4u) * 4u + (p00_coord.y % 4u);
-        uint idx10 = (p10_coord.x % 4u) * 4u + (p10_coord.y % 4u);
-        uint idx01 = (p01_coord.x % 4u) * 4u + (p01_coord.y % 4u);
-        uint idx11 = (p11_coord.x % 4u) * 4u + (p11_coord.y % 4u);
+        uint idx00 = (p00_coord.y % 4u) * 4u + (p00_coord.x % 4u);
+        uint idx10 = (p10_coord.y % 4u) * 4u + (p10_coord.x % 4u);
+        uint idx01 = (p01_coord.y % 4u) * 4u + (p01_coord.x % 4u);
+        uint idx11 = (p11_coord.y % 4u) * 4u + (p11_coord.x % 4u);
 
-        uvec2 n00 = uvec2(p00_coord.y / 4u, p00_coord.x / 4u);
-        uvec2 n10 = uvec2(p10_coord.y / 4u, p10_coord.x / 4u);
-        uvec2 n01 = uvec2(p01_coord.y / 4u, p01_coord.x / 4u);
-        uvec2 n11 = uvec2(p11_coord.y / 4u, p11_coord.x / 4u);
+        uvec2 n00 = uvec2(p00_coord.x / 4u, p00_coord.y / 4u);
+        uvec2 n10 = uvec2(p10_coord.x / 4u, p10_coord.y / 4u);
+        uvec2 n01 = uvec2(p01_coord.x / 4u, p01_coord.y / 4u);
+        uvec2 n11 = uvec2(p11_coord.x / 4u, p11_coord.y / 4u);
 
         uint vq_idx_00; 
         uint vq_idx_10; 
@@ -291,15 +291,15 @@ vec4 evaluate_neural_texture(vec2 uv, float lod) {
         uvec2 p01_coord = uvec2(unwrapped_p01_coord) % conceptual_map_size;
         uvec2 p11_coord = uvec2(unwrapped_p11_coord) % conceptual_map_size;
 
-        uint idx00 = (p00_coord.x % 4u) * 4u + (p00_coord.y % 4u);
-        uint idx10 = (p10_coord.x % 4u) * 4u + (p10_coord.y % 4u);
-        uint idx01 = (p01_coord.x % 4u) * 4u + (p01_coord.y % 4u);
-        uint idx11 = (p11_coord.x % 4u) * 4u + (p11_coord.y % 4u);
+        uint idx00 = (p00_coord.y % 4u) * 4u + (p00_coord.x % 4u);
+        uint idx10 = (p10_coord.y % 4u) * 4u + (p10_coord.x % 4u);
+        uint idx01 = (p01_coord.y % 4u) * 4u + (p01_coord.x % 4u);
+        uint idx11 = (p11_coord.y % 4u) * 4u + (p11_coord.x % 4u);
 
-        uvec2 n00 = uvec2(p00_coord.y / 4u, p00_coord.x / 4u);
-        uvec2 n10 = uvec2(p10_coord.y / 4u, p10_coord.x / 4u);
-        uvec2 n01 = uvec2(p01_coord.y / 4u, p01_coord.x / 4u);
-        uvec2 n11 = uvec2(p11_coord.y / 4u, p11_coord.x / 4u);
+        uvec2 n00 = uvec2(p00_coord.x / 4u, p00_coord.y / 4u);
+        uvec2 n10 = uvec2(p10_coord.x / 4u, p10_coord.y / 4u);
+        uvec2 n01 = uvec2(p01_coord.x / 4u, p01_coord.y / 4u);
+        uvec2 n11 = uvec2(p11_coord.x / 4u, p11_coord.y / 4u);
 
         uint vq_idx_00, vq_idx_10, vq_idx_01, vq_idx_11;
             

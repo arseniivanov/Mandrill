@@ -130,8 +130,9 @@ public:
 
         // Setup camera
         mpCamera = std::make_shared<Camera>(mpDevice, mpWindow, mpSwapchain);
-        mpCamera->setPosition(glm::vec3(5.0f, 0.0f, 0.0f));
+        mpCamera->setPosition(glm::vec3(-135.0f, 430.0f, 100.0f));
         mpCamera->setTarget(glm::vec3(0.0f, 0.0f, 0.0f));
+        mpCamera->setDirection(glm::vec3(0.0f, 0.0f, 1.0f));
         mpCamera->setFov(60.0f);
 
         // Create a sampler that will be used to render materials
