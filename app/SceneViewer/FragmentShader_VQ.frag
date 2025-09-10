@@ -24,6 +24,8 @@ const uint AMBIENT_TEXTURE_BIT = 1 << 2;
 const uint EMISSION_TEXTURE_BIT = 1 << 3;
 const uint NORMAL_TEXTURE_BIT = 1 << 4;
 
+#define USE_COOP_VEC
+
 // --- Push Constants ---
 layout(push_constant) uniform PushConstant {
     uint renderMode;
@@ -379,6 +381,37 @@ vec4 evaluate_neural_texture(vec2 uv, float lod) {
         layer0_activations[out_ch] = max(accumulator, accumulator * LEAKY_RELU_SLOPE);
     }
 
+    #ifdef USE_COOP_VEC
+    uint layer1_out_channels = materialParams.mlpLayerShapes[1].y;
+    uint layer1_in_channels = materialParams.mlpLayerShapes[1].x;
+    float layer1_activations[32]; // Keep as float
+
+    // Convert input activations to a cooperative vector of float16_t
+    coopvecNV<float16_t, 32> layer0_activations_vec;
+    for (int i = 0; i < 32; ++i) {
+        layer0_activations_vec[i] = float16_t(layer0_activations[i]);
+    }
+
+    // Prepare the output vector
+    coopvecNV<float16_t, 32> layer1_activations_vec;
+
+    // Perform the cooperative vector-matrix multiplication and add bias
+    // This single instruction replaces the nested loops.
+    // It calculates: result = (input_vector * weight_matrix) + bias_vector
+    coopVecMatMulAddNV(layer1_activations_vec, layer0_activations_vec, gl_ComponentTypeFloat16NV,
+                       mlpL1_W.data, 0, gl_ComponentTypeFloat16NV, // Matrix B (Weights)
+                       mlpL1_B.data, 0, gl_ComponentTypeFloat16NV, // Vector C (Biases)
+                       32, 32, // M (output channels), K (input channels)
+                       gl_CooperativeVectorMatrixLayoutRowMajorNV, 0);
+
+    // Apply the Leaky ReLU activation function to the entire result vector
+    layer1_activations_vec = max(layer1_activations_vec, layer1_activations_vec * float16_t(LEAKY_RELU_SLOPE));
+
+    // Convert the result back to a standard float array for the next MLP stage
+    for (int i = 0; i < 32; ++i) {
+        layer1_activations[i] = float(layer1_activations_vec[i]);
+    }
+    #else
     // ---- Layer 1 ----
     uint layer1_out_channels = materialParams.mlpLayerShapes[1].y;
     uint layer1_in_channels = materialParams.mlpLayerShapes[1].x;
@@ -395,6 +428,7 @@ vec4 evaluate_neural_texture(vec2 uv, float lod) {
         layer1_activations[out_ch] = max(accumulator, accumulator * LEAKY_RELU_SLOPE);
     }
     
+    #endif
     // ---- Layer 2 (Final Layer) ----
     uint final_out_channels = materialParams.mlpLayerShapes[2].y;
     uint final_in_channels = materialParams.mlpLayerShapes[2].x;
