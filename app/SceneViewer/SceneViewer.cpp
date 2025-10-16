@@ -192,6 +192,28 @@ public:
         // Render scene with the selected pipeline.
         mpScene->render(cmd, mpCamera);
 
+        if (mRenderMode == 9 && mpScene->hasNeuralModel()) {
+            mShaderTimings = mpScene->getTimingResults();
+
+            // Only update the average if we got a valid new measurement from the shader
+            if (mShaderTimings.total_ns > 0) {
+                // A smaller factor means more smoothing. 0.05 is a good starting point.
+                const double smoothingFactor = 0.05;
+
+                // The formula for Exponential Moving Average:
+                // NewAvg = (NewValue * alpha) + (OldAvg * (1 - alpha))
+                // We also convert from nanoseconds to microseconds here by dividing by 1000.0
+                mSmoothedGrid0_us =
+                    (mShaderTimings.grid0_ns / 1000.0) * smoothingFactor + mSmoothedGrid0_us * (1.0 - smoothingFactor);
+                mSmoothedGrid1_us =
+                    (mShaderTimings.grid1_ns / 1000.0) * smoothingFactor + mSmoothedGrid1_us * (1.0 - smoothingFactor);
+                mSmoothedMlp_us =
+                    (mShaderTimings.mlp_ns / 1000.0) * smoothingFactor + mSmoothedMlp_us * (1.0 - smoothingFactor);
+                mSmoothedTotal_us =
+                    (mShaderTimings.total_ns / 1000.0) * smoothingFactor + mSmoothedTotal_us * (1.0 - smoothingFactor);
+            }
+        }
+
         // Render lines
         if (mDrawPolygonLines) {
             // Switch to line rendering
@@ -319,6 +341,21 @@ public:
             if (ImGui::SliderFloat("Camera move speed", &mCameraMoveSpeed, 0.1f, 100.0f)) {
                 mpCamera->setMoveSpeed(mCameraMoveSpeed);
             }
+            if (mRenderMode == 9 && mpScene && mpScene->hasNeuralModel()) {
+                ImGui::Separator();
+                ImGui::Text("NTC Shader Profiling (smoothed, microseconds)"); // Updated title
+
+                // Check against a small floating point threshold instead of just zero
+                if (mSmoothedTotal_us > 0.01) {
+                    // Display the smoothed, microsecond values with 2 decimal places
+                    ImGui::Text("Grid 0 Sampling: %.2f us", mSmoothedGrid0_us);
+                    ImGui::Text("Grid 1 Sampling: %.2f us", mSmoothedGrid1_us);
+                    ImGui::Text("MLP Evaluation:  %.2f us", mSmoothedMlp_us);
+                    ImGui::Text("Total Duration:  %.2f us", mSmoothedTotal_us);
+                } else {
+                    ImGui::Text("Waiting for data from profiling pixel...");
+                }
+            }
         }
 
         ImGui::End();
@@ -366,6 +403,12 @@ private:
     int mMagFilter = 0;
     int mMinFilter = 0;
     int mMipMode = 0;
+
+    Scene::ShaderTimingResults mShaderTimings;
+    double mSmoothedGrid0_us = 0.0;
+    double mSmoothedGrid1_us = 0.0;
+    double mSmoothedMlp_us = 0.0;
+    double mSmoothedTotal_us = 0.0;
 };
 
 int main()

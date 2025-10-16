@@ -663,6 +663,14 @@ void Scene::compile()
             });
             Log::Info("Uploaded positional encoding buffer to GPU: {} bytes", posEncBufferSize);
         }
+        // Create and zero-out the timing buffer
+        const int numTimestamps = 4;
+        VkDeviceSize timingBufferSize = sizeof(uint64_t) * numTimestamps;
+        mpTimingBuffer = make_ptr<Buffer>(mpDevice, timingBufferSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        uint64_t* pTimingData = static_cast<uint64_t*>(mpTimingBuffer->getHostMap());
+        memset(pTimingData, 0, timingBufferSize);
+        Log::Info("Created GPU timing buffer: {} bytes", timingBufferSize);
 
         // Palette Buffer
         if (!mNeuralModelData.palette.values.empty()) {
@@ -1266,7 +1274,8 @@ ptr<Layout> Scene::getLayout(bool forNeural, bool forVqModel)
     desc.emplace_back(3, 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT);
     // 3.3: Neural Positional Encoding Buffer (SSBO) // <<< ADD THIS LINE
     desc.emplace_back(3, 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT);
-
+    // 3.4 Timing buffer
+    desc.emplace_back(3, 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT);
 
     return make_ptr<Layout>(mpDevice, desc);
 }
@@ -1399,6 +1408,8 @@ void Scene::createDescriptors()
                                                                        : mpDummyStorageBuffer);
         globalDesc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                                 mpPositionalEncodingBuffer ? mpPositionalEncodingBuffer : mpDummyStorageBuffer);
+        globalDesc.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                mpTimingBuffer ? mpTimingBuffer : mpDummyStorageBuffer);
     }
 
     auto layoutSet3 = pGlobalLayout->getDescriptorSetLayouts()[3];
@@ -1424,4 +1435,43 @@ void Scene::createDescriptors()
         auto layout = mpStandardLayout->getDescriptorSetLayouts()[4];
         mpRayTracingDescriptor = std::make_unique<Descriptor>(mpDevice, desc, layout);
     }
+}
+
+Scene::ShaderTimingResults Scene::getTimingResults()
+{
+    ShaderTimingResults results{};
+    if (!mpTimingBuffer || !mHasNeuralModel) {
+        return results;
+    }
+
+    const int numTimestamps = 4;
+    const size_t bufferSize = sizeof(uint64_t) * numTimestamps;
+
+    // Get the pointer to the mapped GPU memory
+    const void* pGpuData = mpTimingBuffer->getHostMap();
+    if (!pGpuData) {
+        Log::Warning("Timing buffer is not host-mapped. Cannot read results.");
+        return results;
+    }
+
+    // Copy the data from the GPU-mapped memory into a local CPU array
+    uint64_t timestamps[numTimestamps];
+    std::memcpy(timestamps, pGpuData, bufferSize);
+
+    // If the start or end timestamp is zero, the shader hasn't written fresh data yet.
+    if (timestamps[0] == 0 || timestamps[3] == 0) {
+        return results;
+    }
+
+    results.grid0_ns = timestamps[1] - timestamps[0];
+    results.grid1_ns = timestamps[2] - timestamps[1];
+    results.mlp_ns = timestamps[3] - timestamps[2];
+    results.total_ns = timestamps[3] - timestamps[0];
+
+    // Reset the buffer on the CPU side so we know when the next frame's data is ready.
+    // We can write back to the mapped pointer directly.
+    void* pWritableGpuData = mpTimingBuffer->getHostMap();
+    memset(pWritableGpuData, 0, bufferSize);
+
+    return results;
 }

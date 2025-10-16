@@ -548,6 +548,15 @@ namespace Mandrill
             return nullptr; // No active neural pipeline
         }
 
+        struct ShaderTimingResults {
+            uint64_t grid0_ns = 0;
+            uint64_t grid1_ns = 0;
+            uint64_t mlp_ns = 0;
+            uint64_t total_ns = 0;
+        };
+
+        ShaderTimingResults getTimingResults();
+
     private:
         friend Node;
         // NTC Additions
@@ -566,6 +575,7 @@ namespace Mandrill
         ptr<Buffer> mpPaletteBuffer;
         ptr<Buffer> mpVQCodebookBuffer; // For "vq_codebook_patches_packed_uint8"
         ptr<Buffer> mpPositionalEncodingBuffer;
+        ptr<Buffer> mpTimingBuffer;                                             // Add this for profiling
         std::map<std::pair<int, int>, ptr<Texture>> mSharedVQIndexTextures;     // Key: {level_idx, grid_type}
         std::map<std::pair<int, int>, ptr<Buffer>> mSharedPackedRawGridBuffers; // NON-VQ buffer
         std::map<std::pair<int, int>, glm::ivec2> mSharedVQIndexShapes;         // Key: {level_idx, grid_type}

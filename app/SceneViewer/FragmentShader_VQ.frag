@@ -4,6 +4,10 @@
 #extension GL_NV_cooperative_vector : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 
+#extension GL_EXT_shader_realtime_clock : require
+#extension GL_EXT_shader_atomic_int64 : require
+#extension GL_ARB_gpu_shader_int64 : require
+
 layout(location = 0) in vec3 inNormal;
 layout(location = 1) in vec2 inTexCoord;
 layout(location = 2) in vec3 inTangent;
@@ -110,13 +114,9 @@ layout(set = 3, binding = 1) readonly buffer PaletteBuffer  { float data[]; } pa
 layout(set = 3, binding = 2) readonly buffer VQCodebookBuffer { uint data[]; } vqCodebookBuffer;
 layout(set = 3, binding = 3) readonly buffer PositionalEncodingBuffer { float data[]; } posEncodingBuffer;
 
-float calculate_lod_from_derivatives(vec2 tex_coords) {
-    vec2 texture_dimensions = vec2(textureSize(diffuseTexture, 0));
-    vec2 px = dFdx(tex_coords * texture_dimensions);
-    vec2 py = dFdy(tex_coords * texture_dimensions);
-    float lod = 0.5 * log2(max(dot(px, px), dot(py, py)));
-    return clamp(lod, 0.0, 10.0);
-}
+layout(set = 3, binding = 4) buffer TimingBuffer {
+    uint64_t timestamps[4]; // 0: start, 1: after grid0, 2: after grid1, 3: end
+} timingBuffer;
 
 // =========================================================================
 // NEURAL TEXTURING HELPER FUNCTIONS
@@ -169,14 +169,19 @@ void append_positional_encoding_static(inout float features[128], int base_featu
     features[base_feature_index + 11] = posEncodingBuffer.data[base_lookup_idx_y + 5];
 }
 
-vec4 evaluate_neural_texture(vec2 uv, float lod_inp) {
-    int level_idx = 0;
-    if (lod_inp < 4.0) level_idx = 0;
-    else if (lod_inp < 6.0) level_idx = 1;
-    else if (lod_inp < 8.0) level_idx = 2;
-    else level_idx = 3;
+vec4 evaluate_neural_texture(vec2 uv, float lod) {
+    bool should_profile = (ivec2(gl_FragCoord.xy) == ivec2(RESOLUTION/2, RESOLUTION/2));
 
-    float lod = (lod_inp / 5.0) - 1.0;
+    // CHECKPOINT 0: Start of the function
+    if (should_profile) {
+        timingBuffer.timestamps[0] = clockRealtimeEXT();
+    }
+
+    int level_idx = 0;
+    if (lod < 4.0) level_idx = 0;
+    else if (lod < 6.0) level_idx = 1;
+    else if (lod < 8.0) level_idx = 2;
+    else level_idx = 3;
 
     const int MAX_TOTAL_FEATURES = 128;
     float features[MAX_TOTAL_FEATURES];
@@ -280,6 +285,10 @@ vec4 evaluate_neural_texture(vec2 uv, float lod_inp) {
         }
     }
 
+    if (should_profile) {
+        timingBuffer.timestamps[1] = clockRealtimeEXT();
+    }
+
     uint num_selections_g1 = materialParams.channelCounts[level_idx].y;
     if (num_selections_g1 > 0) {
         uvec3 grid_dims = materialParams.featureGridShapes[level_idx][1].xyz;
@@ -361,112 +370,161 @@ vec4 evaluate_neural_texture(vec2 uv, float lod_inp) {
         }
     }
     //TODO insert padding with 0s between last feature and the LOD for different LODS
-    features[feature_count++] = lod;
+    //TODO normalize LODS
+
+    //Hardcoded normalizied LOD0 
+    features[feature_count++] = -1.0f;
 
     append_positional_encoding_static(features, feature_count, absolute_coords);
     feature_count += 12;
 
+
+    if (should_profile) {
+        timingBuffer.timestamps[2] = clockRealtimeEXT();
+    }
+
     // --- 5. MLP ---
     const float LEAKY_RELU_SLOPE = 0.01;
 
-    // ---- Layer 0 ----
-    uint layer0_out_channels = materialParams.mlpLayerShapes[0].y;
-    uint layer0_in_channels = materialParams.mlpLayerShapes[0].x;
-    
-    // Activations should be full 32-bit floats for precision
-    float layer0_activations[32]; // Keep this as float
-
-    for(int out_ch = 0; out_ch < layer0_out_channels; ++out_ch) {
-        // Load bias (F16) and convert to float
-        float accumulator = float(mlpL0_B.data[out_ch]); 
-        
-        for(int in_ch = 0; in_ch < min(uint(feature_count), layer0_in_channels); ++in_ch) {
-            // Load weight (F16), convert to float for the multiplication
-            float weight = float(mlpL0_W.data[out_ch * layer0_in_channels + in_ch]);
-            accumulator += features[in_ch] * weight;
-        }
-        layer0_activations[out_ch] = max(accumulator, accumulator * LEAKY_RELU_SLOPE);
-    }
-
-    #ifdef USE_COOP_VEC
-    #define COOP_VECTOR_TYPE gl_ComponentTypeFloat16NV
+#ifdef USE_COOP_VEC
+#define COOP_VECTOR_TYPE gl_ComponentTypeFloat16NV
+    const uint layer0_out_channels = 32;
+    const uint layer0_in_channels  = 32;
     const uint layer1_out_channels = 32;
-    const uint layer1_in_channels = 32;
+    const uint layer1_in_channels  = 32;
 
-    float layer1_activations[32]; // Keep as float
-    coopvecNV<float16_t, 32> layer0_activations_vec;
-    coopvecNV<float16_t, 32> layer1_activations_vec;
-
+    // --------------------
+    // Input as coop-vector
+    // --------------------
+    coopvecNV<float16_t, 32> input_features_vec;
     for (int i = 0; i < 32; ++i) {
-        layer0_activations_vec[i] = float16_t(layer0_activations[i]);
+        input_features_vec[i] = float16_t(features[i]);
     }
 
-    // Prepare the output vector
+    // --------------------
+    // Layer 0: MatMul + Bias + LeakyReLU
+    // --------------------
+    coopvecNV<float16_t, 32> layer0_activations_vec;
 
     coopVecMatMulAddNV(
-        layer1_activations_vec,         // out coopvecNV<float16_t,32>
-        layer0_activations_vec,         // in coopvecNV<float16_t,32>
-        gl_ComponentTypeFloat16NV,      // component type of the vector operand
-        mlpL1_W.data, 0,                // matrix storage buffer and element offset
-        gl_ComponentTypeFloat16NV,      // component type of matrix elements
-        mlpL1_B.data, 0,                // bias storage buffer and element offset
-        gl_ComponentTypeFloat16NV,      // component type of bias elements
-        layer1_out_channels,            // M (output channels)
-        layer1_in_channels,             // K (input channels)
-        gl_CooperativeVectorMatrixLayoutColumnMajorNV, // layout enum (choose whichever layout you store)
-        false,                          // transpose? (use as needed)
-        0u                              // spare/flags (often 0)
+        layer0_activations_vec,         // out: activations of layer 0
+        input_features_vec,             // in: feature vector
+        gl_ComponentTypeFloat16NV,
+        mlpL0_W.data, 0,                // layer 0 weight matrix
+        gl_ComponentTypeFloat16NV,
+        mlpL0_B.data, 0,                // layer 0 bias vector
+        gl_ComponentTypeFloat16NV,
+        layer0_out_channels,            // M
+        layer0_in_channels,             // K
+        gl_CooperativeVectorMatrixLayoutColumnMajorNV, // matches your memory layout
+        false,                          // no transpose (flip if you see wrong results)
+        0u
     );
-    // Apply the Leaky ReLU activation function to the entire result vector
-    layer1_activations_vec = max(layer1_activations_vec, layer1_activations_vec * float16_t(LEAKY_RELU_SLOPE));
 
-    // Convert the result back to a standard float array for the next MLP stage
+    // Apply Leaky ReLU activation in-place
+    layer0_activations_vec =
+        max(layer0_activations_vec,
+            layer0_activations_vec * float16_t(LEAKY_RELU_SLOPE));
+
+    // --------------------
+    // Layer 1: MatMul + Bias + LeakyReLU
+    // --------------------
+    coopvecNV<float16_t, 32> layer1_activations_vec;
+
+    coopVecMatMulAddNV(
+        layer1_activations_vec,
+        layer0_activations_vec,
+        gl_ComponentTypeFloat16NV,
+        mlpL1_W.data, 0,
+        gl_ComponentTypeFloat16NV,
+        mlpL1_B.data, 0,
+        gl_ComponentTypeFloat16NV,
+        layer1_out_channels,
+        layer1_in_channels,
+        gl_CooperativeVectorMatrixLayoutColumnMajorNV,
+        false,
+        0u
+    );
+
+    // Apply Leaky ReLU
+    layer1_activations_vec =
+        max(layer1_activations_vec,
+            layer1_activations_vec * float16_t(LEAKY_RELU_SLOPE));
+
+    // --------------------
+    // Convert layer 1 output back to float for final layer
+    // --------------------
+    float layer1_activations[32];
     for (int i = 0; i < 32; ++i) {
         layer1_activations[i] = float(layer1_activations_vec[i]);
     }
-    #else
-    // ---- Layer 1 ----
-    uint layer1_out_channels = materialParams.mlpLayerShapes[1].y;
-    uint layer1_in_channels = materialParams.mlpLayerShapes[1].x;
-    float layer1_activations[32]; // Keep as float
 
-    for(int out_ch = 0; out_ch < layer1_out_channels; ++out_ch) {
+#else
+    // --------------------
+    // CPU-style fallback (layer 0 + 1 as scalar loops)
+    // --------------------
+    uint layer0_out_channels = materialParams.mlpLayerShapes[0].y;
+    uint layer0_in_channels  = materialParams.mlpLayerShapes[0].x;
+
+    float layer0_activations[32];
+
+    for (int out_ch = 0; out_ch < layer0_out_channels; ++out_ch) {
+        float accumulator = float(mlpL0_B.data[out_ch]);
+        for (int in_ch = 0; in_ch < min(uint(feature_count), layer0_in_channels); ++in_ch) {
+            float weight = float(mlpL0_W.data[out_ch * layer0_in_channels + in_ch]);
+            accumulator += features[in_ch] * weight;
+        }
+        layer0_activations[out_ch] =
+            max(accumulator, accumulator * LEAKY_RELU_SLOPE);
+    }
+
+    uint layer1_out_channels = materialParams.mlpLayerShapes[1].y;
+    uint layer1_in_channels  = materialParams.mlpLayerShapes[1].x;
+
+    float layer1_activations[32];
+
+    for (int out_ch = 0; out_ch < layer1_out_channels; ++out_ch) {
         float accumulator = float(mlpL1_B.data[out_ch]);
-        
-        // Input to this layer comes from the previous layer's activations
-        for(int in_ch = 0; in_ch < min(layer0_out_channels, layer1_in_channels); ++in_ch) {
+        for (int in_ch = 0; in_ch < min(layer0_out_channels, layer1_in_channels); ++in_ch) {
             float weight = float(mlpL1_W.data[out_ch * layer1_in_channels + in_ch]);
             accumulator += layer0_activations[in_ch] * weight;
         }
-        layer1_activations[out_ch] = max(accumulator, accumulator * LEAKY_RELU_SLOPE);
+        layer1_activations[out_ch] =
+            max(accumulator, accumulator * LEAKY_RELU_SLOPE);
     }
-    
-    #endif
+#endif
+
     // ---- Layer 2 (Final Layer) ----
     uint final_out_channels = materialParams.mlpLayerShapes[2].y;
-    uint final_in_channels = materialParams.mlpLayerShapes[2].x;
+    uint final_in_channels  = materialParams.mlpLayerShapes[2].x;
     vec4 final_color = vec4(0.0, 0.0, 0.0, 1.0);
 
-    for(int out_ch = 0; out_ch < final_out_channels; ++out_ch) {
+    for (int out_ch = 0; out_ch < final_out_channels; ++out_ch) {
         float accumulator = float(mlpL2_B.data[out_ch]);
-        
-        for(int in_ch = 0; in_ch < min(layer1_out_channels, final_in_channels); ++in_ch) {
+        for (int in_ch = 0; in_ch < min(layer1_out_channels, final_in_channels); ++in_ch) {
             float weight = float(mlpL2_W.data[out_ch * final_in_channels + in_ch]);
             accumulator += layer1_activations[in_ch] * weight;
         }
-
         if (out_ch < materialParams.denormChannelCount) {
             float mean = materialParams.denormMean[out_ch / 4][out_ch % 4];
             float std  = materialParams.denormStd[out_ch / 4][out_ch % 4];
             accumulator = accumulator * std + mean;
         }
-        
-        if(out_ch < 4) {
-          final_color[out_ch] = accumulator;
+        if (out_ch < 4) {
+            final_color[out_ch] = accumulator;
         }
     }
 
+    if (distance(vec2(0.0,0.0), python_uv) < 0.02){
+        final_color = vec4(1.0,0.0,1.0,1.0);
+        return final_color;
+      }
     // Return the calculated color
+
+    if (should_profile) {
+        timingBuffer.timestamps[3] = clockRealtimeEXT();
+    }
+
     return final_color; 
 }
 
@@ -535,34 +593,15 @@ void main() {
           fragColor.rgb = fragColor.rgb * 0.5 + 0.5;
       }
 
-      // NTC Bilinear
+      // Texture coordinates
       if (pushConstant.renderMode == 8) {
-          float calculated_lod = 0.0;
-          vec2 texelSize = 1.0 / vec2(textureSize(diffuseTexture, 0));
-          vec2 uv_scaled = inTexCoord / texelSize;
-          vec2 frac = fract(uv_scaled);
-          vec2 uv00 = floor(uv_scaled) * texelSize; // Top-left corner
-          vec2 uv10 = uv00 + vec2(texelSize.x, 0.0); // Top-right
-          vec2 uv01 = uv00 + vec2(0.0, texelSize.y); // Bottom-left
-          vec2 uv11 = uv00 + texelSize;              // Bottom-right
-
-          vec4 c00 = evaluate_neural_texture(uv00, calculated_lod); // Top-left
-          vec4 c10 = evaluate_neural_texture(uv10, calculated_lod); // Top-right
-          vec4 c01 = evaluate_neural_texture(uv01, calculated_lod); // Bottom-left
-          vec4 c11 = evaluate_neural_texture(uv11, calculated_lod); // Bottom-right
-
-          vec4 top_interp = mix(c00, c10, frac.x);
-          vec4 bottom_interp = mix(c01, c11, frac.x);
-
-          fragColor = mix(top_interp, bottom_interp, frac.y);
+          fragColor = vec4(inTexCoord, 0.0, 1.0);
       }
 
       // NTC 
       if (pushConstant.renderMode == 9) {
           vec2 uv = inTexCoord;
-          //float calculated_lod = calculate_lod_from_derivatives(inTexCoord);
-          float calculated_lod = 0;
-          fragColor = evaluate_neural_texture(uv, calculated_lod);
+          fragColor = evaluate_neural_texture(uv, pushConstant.lod);
 
       // Line render
       if (pushConstant.renderMode == 10) {
@@ -570,4 +609,3 @@ void main() {
       }
   }
 }
-
