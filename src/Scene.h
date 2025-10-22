@@ -559,6 +559,7 @@ namespace Mandrill
 
     private:
         friend Node;
+        PFN_vkConvertCooperativeVectorMatrixNV mpfnVkConvertCooperativeVectorMatrixNV;
         // NTC Additions
         SafetensorsModelData mNeuralModelData;
         bool mHasNeuralModel = false;

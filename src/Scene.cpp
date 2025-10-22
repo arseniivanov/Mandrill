@@ -11,6 +11,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#define USE_COOP_VEC
+
 using namespace Mandrill;
 
 enum MaterialTextureBit {
@@ -32,7 +34,6 @@ Node::~Node()
 {
 }
 
-// REPLACE the existing Node::render function with this:
 void Node::render(VkCommandBuffer cmd, const ptr<Camera> pCamera, const ptr<const Scene> pScene) const
 {
     if (!mVisible) {
@@ -101,6 +102,12 @@ Scene::Scene(ptr<Device> pDevice, ptr<Swapchain> pSwapchain, bool supportRayTrac
                             0x88, 0x00, 0xff, 0xff, 0xff, 0x00, 0xff, 0xff};
     mpMissingTexture =
         make_ptr<Texture>(pDevice, Texture::Type::Texture2D, VK_FORMAT_R8G8B8A8_UNORM, data, 2, 2, 1, 4, false);
+
+    mpfnVkConvertCooperativeVectorMatrixNV = (PFN_vkConvertCooperativeVectorMatrixNV)vkGetInstanceProcAddr(
+        mpDevice->getInstance(), "vkConvertCooperativeVectorMatrixNV");
+    if (!mpfnVkConvertCooperativeVectorMatrixNV) {
+        Log::Error("Failed to get vkConvertCooperativeVectorMatrixNV. Coop vectors will not work.");
+    }
 }
 
 Scene::~Scene()
@@ -928,48 +935,117 @@ void Scene::compile()
                         mat.params.mlpLayerShapes[sm_layer.layer_idx].y = sm_layer.weights_shape[0];
                     }
 
-                    // Weights
-                    if (!sm_layer.weights_raw_bytes.empty()) {
-                        VkDeviceSize bufferSize = sm_layer.weights_raw_bytes.size();
-                        ptr<Buffer> pGpuBuffer = make_ptr<Buffer>(
-                            mpDevice, bufferSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-                        ptr<Buffer> pStaging = make_ptr<Buffer>(mpDevice, bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                                                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                                                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-                        pStaging->copyFromHost(sm_layer.weights_raw_bytes.data(), bufferSize);
-                        executeSingleTimeCommands(mpDevice, [&](VkCommandBuffer cmd) {
-                            VkBufferCopy cr{};
-                            cr.size = bufferSize;
-                            vkCmdCopyBuffer(cmd, pStaging->getBuffer(), pGpuBuffer->getBuffer(), 1, &cr);
-                        });
-                        mat.mlpWeightBuffers[sm_layer.layer_idx] = pGpuBuffer;
-                        Log::Info("Uploaded MLP L{} weights for '{}', {} bytes", sm_layer.layer_idx, mat.neuralLinkName,
-                                  bufferSize);
-                    } else {
-                        mat.mlpWeightBuffers[sm_layer.layer_idx] = nullptr;
-                    }
+                    if (sm_layer.layer_idx == 1) {
+                        if (!sm_layer.weights_raw_bytes.empty()) {
+                            Log::Info("Uploading pre-formatted float16 data for COOP-VEC Layer {}", sm_layer.layer_idx);
+                            const float* srcWeightData =
+                                reinterpret_cast<const float*>(sm_layer.weights_raw_bytes.data());
+                            uint32_t rows = sm_layer.weights_shape[0]; // M
+                            uint32_t cols = sm_layer.weights_shape[1]; // K
 
-                    // Bias
-                    if (!sm_layer.bias_raw_bytes.empty()) {
-                        VkDeviceSize bufferSize = sm_layer.bias_raw_bytes.size();
-                        ptr<Buffer> pGpuBuffer = make_ptr<Buffer>(
-                            mpDevice, bufferSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-                        ptr<Buffer> pStaging = make_ptr<Buffer>(mpDevice, bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                                                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                                                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-                        pStaging->copyFromHost(sm_layer.bias_raw_bytes.data(), bufferSize);
-                        executeSingleTimeCommands(mpDevice, [&](VkCommandBuffer cmd) {
-                            VkBufferCopy cr{};
-                            cr.size = bufferSize;
-                            vkCmdCopyBuffer(cmd, pStaging->getBuffer(), pGpuBuffer->getBuffer(), 1, &cr);
-                        });
-                        mat.mlpBiasBuffers[sm_layer.layer_idx] = pGpuBuffer;
-                        Log::Info("Uploaded MLP L{} bias for '{}', {} bytes", sm_layer.layer_idx, mat.neuralLinkName,
-                                  bufferSize);
+                            // 1. Query size
+                            size_t convertedSize = 0;
+                            VkConvertCooperativeVectorMatrixInfoNV queryInfo = {
+                                .sType = VK_STRUCTURE_TYPE_CONVERT_COOPERATIVE_VECTOR_MATRIX_INFO_NV,
+                                .srcSize = sm_layer.weights_raw_bytes.size(),
+                                .pDstSize = &convertedSize,
+                                .srcComponentType = VK_COMPONENT_TYPE_FLOAT32_KHR,
+                                .dstComponentType = VK_COMPONENT_TYPE_FLOAT16_KHR,
+                                .numRows = rows,
+                                .numColumns = cols,
+                                .srcLayout = VK_COOPERATIVE_VECTOR_MATRIX_LAYOUT_ROW_MAJOR_NV,
+                                .srcStride = sizeof(float) * cols, // <-- ADDED: Bytes per row in source data
+                                .dstLayout = VK_COOPERATIVE_VECTOR_MATRIX_LAYOUT_ROW_MAJOR_NV, // <-- CORRECTED: Must
+                                                                                               // match shader
+                            };
+                            mpfnVkConvertCooperativeVectorMatrixNV(mpDevice->getDevice(), &queryInfo);
+
+                            Log::Info("Starting to convert");
+                            // 2. Convert
+                            std::vector<uint8_t> convertedWeightData(convertedSize);
+                            VkConvertCooperativeVectorMatrixInfoNV convertInfo = queryInfo;
+                            convertInfo.srcData.hostAddress = (void*)srcWeightData;
+                            convertInfo.dstData.hostAddress = convertedWeightData.data();
+                            mpfnVkConvertCooperativeVectorMatrixNV(mpDevice->getDevice(), &convertInfo);
+
+                            Log::Info("Starting to upload");
+                            // 3. Upload converted data
+                            ptr<Buffer> pGpuBuffer =
+                                make_ptr<Buffer>(mpDevice, convertedSize,
+                                                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                            pGpuBuffer->copyFromHost(convertedWeightData.data(), convertedSize);
+                            mat.mlpWeightBuffers[sm_layer.layer_idx] = pGpuBuffer;
+                        }
+
+                        Log::Info("Starting to process biases");
+                        // --- Bias ---
+                        if (!sm_layer.bias_raw_bytes.empty()) {
+                            const float* srcBiasData = reinterpret_cast<const float*>(sm_layer.bias_raw_bytes.data());
+                            size_t biasCount = sm_layer.bias_raw_bytes.size() / sizeof(float);
+
+                            // 1. Convert float32 to float16 on CPU
+                            std::vector<uint16_t> convertedBiasData;
+                            for (size_t i = 0; i < biasCount; ++i) {
+                                convertedBiasData.push_back(glm::detail::toFloat16(srcBiasData[i]));
+                            }
+
+                            // 2. Upload converted data
+                            VkDeviceSize bufferSize = convertedBiasData.size() * sizeof(uint16_t);
+                            ptr<Buffer> pGpuBuffer =
+                                make_ptr<Buffer>(mpDevice, bufferSize,
+                                                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                            pGpuBuffer->copyFromHost(convertedBiasData.data(), bufferSize);
+                            mat.mlpBiasBuffers[sm_layer.layer_idx] = pGpuBuffer;
+                        }
                     } else {
-                        mat.mlpBiasBuffers[sm_layer.layer_idx] = nullptr;
+                        Log::Info("Converting and uploading float32 data for SCALAR Layer {}", sm_layer.layer_idx);
+                        // Weights
+                        if (!sm_layer.weights_raw_bytes.empty()) {
+                            VkDeviceSize bufferSize = sm_layer.weights_raw_bytes.size();
+                            ptr<Buffer> pGpuBuffer =
+                                make_ptr<Buffer>(mpDevice, bufferSize,
+                                                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                            ptr<Buffer> pStaging = make_ptr<Buffer>(
+                                mpDevice, bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                            pStaging->copyFromHost(sm_layer.weights_raw_bytes.data(), bufferSize);
+                            executeSingleTimeCommands(mpDevice, [&](VkCommandBuffer cmd) {
+                                VkBufferCopy cr{};
+                                cr.size = bufferSize;
+                                vkCmdCopyBuffer(cmd, pStaging->getBuffer(), pGpuBuffer->getBuffer(), 1, &cr);
+                            });
+                            mat.mlpWeightBuffers[sm_layer.layer_idx] = pGpuBuffer;
+                            Log::Info("Uploaded MLP L{} weights for '{}', {} bytes", sm_layer.layer_idx,
+                                      mat.neuralLinkName, bufferSize);
+                        } else {
+                            mat.mlpWeightBuffers[sm_layer.layer_idx] = nullptr;
+                        }
+
+                        // Bias
+                        if (!sm_layer.bias_raw_bytes.empty()) {
+                            VkDeviceSize bufferSize = sm_layer.bias_raw_bytes.size();
+                            ptr<Buffer> pGpuBuffer =
+                                make_ptr<Buffer>(mpDevice, bufferSize,
+                                                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                            ptr<Buffer> pStaging = make_ptr<Buffer>(
+                                mpDevice, bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                            pStaging->copyFromHost(sm_layer.bias_raw_bytes.data(), bufferSize);
+                            executeSingleTimeCommands(mpDevice, [&](VkCommandBuffer cmd) {
+                                VkBufferCopy cr{};
+                                cr.size = bufferSize;
+                                vkCmdCopyBuffer(cmd, pStaging->getBuffer(), pGpuBuffer->getBuffer(), 1, &cr);
+                            });
+                            mat.mlpBiasBuffers[sm_layer.layer_idx] = pGpuBuffer;
+                            Log::Info("Uploaded MLP L{} bias for '{}', {} bytes", sm_layer.layer_idx,
+                                      mat.neuralLinkName, bufferSize);
+                        } else {
+                            mat.mlpBiasBuffers[sm_layer.layer_idx] = nullptr;
+                        }
                     }
                 }
             }
