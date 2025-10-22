@@ -138,6 +138,9 @@ public:
         // Create a sampler that will be used to render materials
         mpSampler = std::make_shared<Sampler>(mpDevice);
 
+        mScenePath = "../res/sponza/sponza.obj";
+        loadScene();
+
         // Initialize GUI
         App::createGUI(mpDevice, mpPass);
     }

@@ -386,83 +386,6 @@ vec4 evaluate_neural_texture(vec2 uv, float lod) {
     // --- 5. MLP ---
     const float LEAKY_RELU_SLOPE = 0.01;
 
-#ifdef USE_COOP_VEC
-#define COOP_VECTOR_TYPE gl_ComponentTypeFloat16NV
-    const uint layer0_out_channels = 32;
-    const uint layer0_in_channels  = 32;
-    const uint layer1_out_channels = 32;
-    const uint layer1_in_channels  = 32;
-
-    // --------------------
-    // Input as coop-vector
-    // --------------------
-    coopvecNV<float16_t, 32> input_features_vec;
-    for (int i = 0; i < 32; ++i) {
-        input_features_vec[i] = float16_t(features[i]);
-    }
-
-    // --------------------
-    // Layer 0: MatMul + Bias + LeakyReLU
-    // --------------------
-    coopvecNV<float16_t, 32> layer0_activations_vec;
-
-    coopVecMatMulAddNV(
-        layer0_activations_vec,         // out: activations of layer 0
-        input_features_vec,             // in: feature vector
-        gl_ComponentTypeFloat16NV,
-        mlpL0_W.data, 0,                // layer 0 weight matrix
-        gl_ComponentTypeFloat16NV,
-        mlpL0_B.data, 0,                // layer 0 bias vector
-        gl_ComponentTypeFloat16NV,
-        layer0_out_channels,            // M
-        layer0_in_channels,             // K
-        gl_CooperativeVectorMatrixLayoutColumnMajorNV, // matches your memory layout
-        false,                          // no transpose (flip if you see wrong results)
-        0u
-    );
-
-    // Apply Leaky ReLU activation in-place
-    layer0_activations_vec =
-        max(layer0_activations_vec,
-            layer0_activations_vec * float16_t(LEAKY_RELU_SLOPE));
-
-    // --------------------
-    // Layer 1: MatMul + Bias + LeakyReLU
-    // --------------------
-    coopvecNV<float16_t, 32> layer1_activations_vec;
-
-    coopVecMatMulAddNV(
-        layer1_activations_vec,
-        layer0_activations_vec,
-        gl_ComponentTypeFloat16NV,
-        mlpL1_W.data, 0,
-        gl_ComponentTypeFloat16NV,
-        mlpL1_B.data, 0,
-        gl_ComponentTypeFloat16NV,
-        layer1_out_channels,
-        layer1_in_channels,
-        gl_CooperativeVectorMatrixLayoutColumnMajorNV,
-        false,
-        0u
-    );
-
-    // Apply Leaky ReLU
-    layer1_activations_vec =
-        max(layer1_activations_vec,
-            layer1_activations_vec * float16_t(LEAKY_RELU_SLOPE));
-
-    // --------------------
-    // Convert layer 1 output back to float for final layer
-    // --------------------
-    float layer1_activations[32];
-    for (int i = 0; i < 32; ++i) {
-        layer1_activations[i] = float(layer1_activations_vec[i]);
-    }
-
-#else
-    // --------------------
-    // CPU-style fallback (layer 0 + 1 as scalar loops)
-    // --------------------
     uint layer0_out_channels = materialParams.mlpLayerShapes[0].y;
     uint layer0_in_channels  = materialParams.mlpLayerShapes[0].x;
 
@@ -477,6 +400,44 @@ vec4 evaluate_neural_texture(vec2 uv, float lod) {
         layer0_activations[out_ch] =
             max(accumulator, accumulator * LEAKY_RELU_SLOPE);
     }
+
+#ifdef USE_COOP_VEC
+#define COOP_VECTOR_TYPE gl_ComponentTypeFloat16NV
+    const uint layer1_out_channels = 32;
+    const uint layer1_in_channels  = 32;
+
+    coopvecNV<float16_t, 32> layer0_activations_nv;
+    for (int i = 0; i < 32; ++i) {
+        layer0_activations_nv[i] = float16_t(layer0_activations[i]);
+    }
+
+    coopvecNV<float16_t, 32> layer1_activations_vec;
+
+    coopVecMatMulAddNV(
+        layer1_activations_vec,
+        layer0_activations_nv,
+        gl_ComponentTypeFloat16NV,
+        mlpL1_W.data, 0,
+        gl_ComponentTypeFloat16NV,
+        mlpL1_B.data, 0,
+        gl_ComponentTypeFloat16NV,
+        layer1_out_channels,
+        layer1_in_channels,
+        gl_CooperativeVectorMatrixLayoutRowMajorNV,
+        true,
+        0u
+    );
+
+    layer1_activations_vec =
+        max(layer1_activations_vec,
+            layer1_activations_vec * float16_t(LEAKY_RELU_SLOPE));
+
+    float layer1_activations[32];
+    for (int i = 0; i < 32; ++i) {
+        layer1_activations[i] = float(layer1_activations_vec[i]);
+    }
+
+#else
 
     uint layer1_out_channels = materialParams.mlpLayerShapes[1].y;
     uint layer1_in_channels  = materialParams.mlpLayerShapes[1].x;
